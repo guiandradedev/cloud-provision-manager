@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  provision-mysql:
+    image: mysql:8.0
+    container_name: provision-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: provision-manager
+    ports:
+      - "3306:3306"
+    volumes:
+      - provision-mysql-data:/var/lib/mysql
+
+volumes:
+  provision-mysql-data:
