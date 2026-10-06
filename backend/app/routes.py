@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
@@ -16,6 +17,12 @@ UPLOADS_DIR = Path("uploads")
 
 class CreateEnviromentRequest(BaseModel):
     name: str
+
+
+class JobLogResponse(BaseModel):
+    source: str
+    content: str
+    created_at: datetime
 
 
 @router.post("/environment", status_code=status.HTTP_201_CREATED)
@@ -104,3 +111,99 @@ async def create_job(
 
     asyncio.create_task(run_job(job_id, script_content))
     return {"id": job_id, "status": "running"}
+
+@router.get("/jobs/{job_id}", status_code=status.HTTP_200_OK)
+async def get_job_status(job_id: str) -> dict[str, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text("SELECT status FROM jobs WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        job_status = result.scalar_one_or_none()
+
+    if job_status is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {"id": job_id, "status": job_status}
+
+@router.get("/jobs/{job_id}/output", status_code=status.HTTP_200_OK)
+async def get_job_output(
+    job_id: str,
+) -> dict[str, str | list[JobLogResponse]]:
+    async with SessionLocal() as session:
+        job_result = await session.execute(
+            text("SELECT id FROM jobs WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        if job_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        logs_result = await session.execute(
+            text(
+                """
+                SELECT stream, message, created_at
+                FROM job_logs
+                WHERE job_id = :job_id
+                ORDER BY id
+                """
+            ),
+            {"job_id": job_id},
+        )
+        logs = logs_result.mappings().all()
+
+    output = [
+        JobLogResponse(
+            source=log["stream"],
+            content=log["message"],
+            created_at=log["created_at"],
+        )
+        for log in logs
+    ]
+    return {"id": job_id, "output": output}
+
+@router.get("/jobs", status_code=status.HTTP_200_OK)
+async def get_jobs() -> list[dict[str, str]]:
+    async with SessionLocal() as session:
+        result = await session.execute(text("SELECT id, status FROM jobs"))
+        jobs = result.fetchall()
+
+    return [{"id": job.id, "status": job.status} for job in jobs]
+
+@router.get("/environment", status_code=status.HTTP_200_OK)
+async def get_environments() -> list[dict[str, str]]:
+    async with SessionLocal() as session:
+        result = await session.execute(text("SELECT id, name FROM environments"))
+        environments = result.fetchall()
+
+    return [{"id": env.id, "name": env.name} for env in environments]
+
+@router.get("/environment/{env_id}", status_code=status.HTTP_200_OK)
+async def get_environment(env_id: str) -> dict[str, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text("SELECT id, name FROM environments WHERE id = :env_id"),
+            {"env_id": env_id},
+        )
+        environment = result.mappings().one_or_none()
+
+    if environment is None:
+        raise HTTPException(status_code=404, detail="Environment not found")
+
+    return {"id": environment["id"], "name": environment["name"]}
+
+@router.get("/environment/{env_id}/jobs", status_code=status.HTTP_200_OK)
+async def get_environment_jobs(env_id: str) -> list[dict[str, str]]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT id, status
+                FROM jobs
+                WHERE env_id = :env_id
+                """
+            ),
+            {"env_id": env_id},
+        )
+        jobs = result.mappings().all()
+
+    return [{"id": job["id"], "status": job["status"]} for job in jobs]
