@@ -6,7 +6,9 @@ from .config import settings
 from .database import engine
 from .migrations import run_migrations
 from .routes import router
+import os
 
+os.mkdir("uploads") if not os.path.exists("uploads") else None
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):

@@ -5,3 +5,4 @@ aiomysql
 cryptography
 python-dotenv
 pydantic_settings
+python-multipart
