@@ -1,0 +1,123 @@
+require "fileutils"
+
+env_file = File.join(__dir__, ".env")
+
+if File.exist?(env_file)
+    File.readlines(env_file).each do |line|
+        line = line.strip
+        next if line.empty? || line.start_with?("#")
+
+        key, value = line.split("=", 2)
+        next unless key && value
+
+        value = value.strip.gsub(/\A["']|["']\z/, "")
+        ENV[key.strip] = value
+    end
+end
+
+# variáveis comuns
+# BOX = is_arm ? "bento/ubuntu-22.04" : "ubuntu/focal64"
+# API_BOX = "bento/ubuntu-24.04"
+# KAFKA_BOX = is_arm ? "bento/ubuntu-22.04" : "ubuntu/jammy64"
+
+
+env_vars = {
+    "REPO_URL"   => ENV["REPO_URL"] || "https://github.com/guiandradedev/cloud-provision-manager",
+    "BRANCH_NAME"=> ENV["BRANCH_NAME"] || "main",
+    "DB_USER"    => ENV["DB_USER"] || "root",
+    "DB_PASS"    => ENV["DB_PASS"] || "example",
+    "ALLOWED_ORIGIN_URL" => ENV["ALLOWED_ORIGIN_URL"] || "http://localhost:8069",
+    "SANDBOX_RAM" => ENV["SANDBOX_RAM"] || 4096
+}
+
+
+Vagrant.configure("2") do |config|
+
+    is_arm = RUBY_PLATFORM.include?("arm64") || RUBY_PLATFORM.include?("aarch64")
+
+    # configurações globais do virtualbox (aplica a todas as vms)
+    config.vm.provider "virtualbox" do |vb|
+        vb.gui = !is_arm
+    end
+
+    # dicionário de vms com as configurações de cada uma
+    vms = {
+        "webserver" => { ip: "10.20.30.1", ram: 1024, cpus: 1 },
+        "sandbox"   => { ip: "10.20.30.2", ram: env_vars["SANDBOX_RAM"], cpus: 1 },
+        "db"        => { ip: "10.20.30.3", ram: 1024, cpus: 1 }
+    }
+
+    vms.each do |nome, specs|
+        config.vm.define nome do |node|
+            node.vm.box = "bento/ubuntu-24.04"
+            node.vm.hostname = nome
+            
+            # rede interna 
+            node.vm.network "private_network", ip: specs[:ip], netmask: "255.255.255.240", virtualbox__intnet: "intnet1"
+
+            # port forwarding apenas para o Proxy
+            if nome == "webserver"
+                node.vm.network "forwarded_port", guest: 80, host: "8069", auto_correct: true
+            end
+
+            # Configurações específicas para cada VM
+            node.vm.provider "virtualbox" do |vb|
+                vb.name = nome
+                vb.memory = specs[:ram]
+                vb.cpus = specs[:cpus]
+            end
+
+            node.vm.provision "shell", env: env_vars, inline: <<-SHELL
+                set -e
+
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -y
+                apt-get install -y curl git netcat-openbsd
+
+                mkdir -p /home/application
+                cd /home/application
+
+                rm -rf provision-manager
+                git clone --branch "${BRANCH_NAME}" --single-branch "${REPO_URL}" provision-manager
+                cd provision-manager/infra/scripts
+
+                if [[ "#{nome}" != "webserver" ]]; then
+                    sh ./setup-common-network.sh
+                fi
+
+                sh ./setup-#{nome}.sh
+    		SHELL
+
+        end
+    end
+
+    # trigger para remover pasta residual da VM após destruí-la
+    config.trigger.after :destroy do |trigger|
+        trigger.ruby do |env, machine|
+            vbox_vms_dir = ENV["VBOX_VMS_DIR"]
+
+            if vbox_vms_dir.nil? || vbox_vms_dir.empty?
+                env.ui.warn "VBOX_VMS_DIR não definida. Ignorando remoção da pasta da VM #{machine.name}..."
+                next
+            end
+
+            vm_dir = File.join(vbox_vms_dir, machine.name.to_s)
+
+            # polling enquanto vbox não liberou a pasta
+            5.times do |attempt|
+                break unless File.exist?(vm_dir)
+
+                begin
+                    FileUtils.rm_r(vm_dir)
+                rescue SystemCallError
+                    sleep 1
+                end
+            end
+
+            if File.exist?(vm_dir)
+                env.ui.warn "Não foi possível remover a pasta residual da VM #{machine.name}."
+            end
+        end
+    end
+    
+end
