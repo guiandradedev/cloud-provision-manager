@@ -4,10 +4,15 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 
-sudo apt-get -y update
+apt-get update -y
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-sudo apt install -y python3 python3-pip python3-venv nginx iptables-persistent nodejs
+
+# iptables-persistent asks whether the current rules should be saved while its
+# post-install script runs. Preseed both answers so provisioning never blocks.
+echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
+echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
+apt-get install -y python3 python3-pip python3-venv nginx iptables-persistent nodejs
 
 cat > /etc/sysctl.d/99-provision-manager-gateway.conf <<'EOF'
 net.ipv4.ip_forward=1
