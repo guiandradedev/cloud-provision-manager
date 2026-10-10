@@ -29,18 +29,19 @@ class JobLogResponse(BaseModel):
 @router.post("/environment", status_code=status.HTTP_201_CREATED)
 async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str]:
     env_id = str(uuid.uuid4())
-
-    # async with SessionLocal() as session:
-    #     await session.execute(
-    #         text(
-    #             """
-    #             INSERT INTO environments (id, name, created_at)
-    #             VALUES (:env_id, :name, NOW())
-    #             """
-    #         ),
-    #         {"env_id": env_id, "name": request.name},
-    #     )
-    #     await session.commit()
+    
+    # 1. DESCOMENTAR A INSERÇÃO NA BASE DE DADOS (obrigatório para o job achar o ambiente)
+    async with SessionLocal() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO environments (id, name, created_at)
+                VALUES (:env_id, :name, NOW())
+                """
+            ),
+            {"env_id": env_id, "name": request.name},
+        )
+        await session.commit()
 
     env_data = CreateEnvironment(
         name=request.name,
@@ -49,7 +50,7 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
         mem_limit=512,
         cpu_weight=100,
     )
-
+    
     try:
         result = await create_env(env_data)
     except (RuntimeError, ValueError) as error:
@@ -74,65 +75,48 @@ async def create_job(
 ) -> dict[str, str]:
     job_id = str(uuid.uuid4())
 
-    # Valida se o ambiente existe
+    # CORREÇÃO: Consulta o nome do ambiente correspondente ao ID submetido
     async with SessionLocal() as session:
         environment = await session.execute(
-            text("SELECT id FROM environments WHERE id = :env_id"),
+            text("SELECT name FROM environments WHERE id = :env_id"),
             {"env_id": env_id},
         )
-        if environment.scalar_one_or_none() is None:
+        env_name = environment.scalar_one_or_none()
+        if not env_name:
             raise HTTPException(status_code=404, detail="Environment not found")
 
-    # Valida se o arquivo de script é um arquivo sh
     if not script.filename or not script.filename.endswith(".sh"):
         raise HTTPException(status_code=400, detail="Invalid script file type")
 
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     file_path = UPLOADS_DIR / f"{job_id}-{Path(script.filename).name}"
     contents = await script.read()
+
     try:
         script_content = contents.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise HTTPException(
-            status_code=400,
-            detail="Script must be a valid UTF-8 text file",
-        ) from error
+        raise HTTPException(status_code=400, detail="Script must be a valid UTF-8 text file") from error
 
     file_path.write_bytes(contents)
 
     try:
         async with SessionLocal.begin() as session:
             await session.execute(
-                text(
-                    """
-                    INSERT INTO jobs (id, status, env_id, created_at)
-                    VALUES (:job_id, 'queued', :env_id, NOW())
-                    """
-                ),
+                text("INSERT INTO jobs (id, status, env_id, created_at) VALUES (:job_id, 'queued', :env_id, NOW())"),
                 {"job_id": job_id, "env_id": env_id},
             )
             await session.execute(
-                text(
-                    """
-                    INSERT INTO files (id, job_id, name, path, created_at)
-                    VALUES (:file_id, :job_id, :name, :path, NOW())
-                    """
-                ),
-                {
-                    "file_id": str(uuid.uuid4()),
-                    "job_id": job_id,
-                    "name": script.filename,
-                    "path": str(file_path),
-                },
+                text("INSERT INTO files (id, job_id, name, path, created_at) VALUES (:file_id, :job_id, :name, :path, NOW())"),
+                {"file_id": str(uuid.uuid4()), "job_id": job_id, "name": script.filename, "path": str(file_path)},
             )
     except SQLAlchemyError as error:
         file_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Could not create the job",
-        ) from error
+        raise HTTPException(status_code=500, detail="Could not create the job") from error
 
-    asyncio.create_task(run_job(job_id, script_content))
+    # CORREÇÃO: Reconstrói a nomenclatura exata do Cgroup (igual ao create_env.py) e passa para o Job
+    cgroup_name = env_name.replace(" ", "_").lower() + f"_{env_id[:8]}"
+    asyncio.create_task(run_job(job_id, script_content, cgroup_name))
+
     return {"id": job_id, "status": "running"}
 
 @router.get("/jobs/{job_id}", status_code=status.HTTP_200_OK)

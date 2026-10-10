@@ -1,7 +1,6 @@
 import asyncio
-
+import shlex
 from sqlalchemy import text
-
 from ..database import SessionLocal
 
 
@@ -26,16 +25,25 @@ async def read_stream(stream, job_id: str, stream_name: str) -> None:
         await save_log(job_id, stream_name, message)
 
 
-async def run_job(job_id: str, script: str) -> int:
+async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
+    cgroup_path = f"/sys/fs/cgroup/{env_cgroup_name}"
+    safe_script = shlex.quote(script)
+    
+    # CORREÇÃO: Escreve o PID ($$) na pasta do Cgroup do ambiente associado ANTES do unshare
+    wrapper_cmd = (
+        f"echo $$ > {cgroup_path}/cgroup.procs && "
+        f"exec /usr/bin/unshare --mount --pid --fork --ipc --mount-proc bash -c {safe_script}"
+    )
+
     process = await asyncio.create_subprocess_exec(
         "bash",
         "-c",
-        script,
+        wrapper_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-
-    print(f"Job {job_id} iniciado (PID={process.pid})")
+    
+    print(f"Job {job_id} iniciado no Cgroup '{env_cgroup_name}' (PID={process.pid})")
     await _mark_job_as_running(job_id, process.pid)
 
     await asyncio.gather(
@@ -45,6 +53,7 @@ async def run_job(job_id: str, script: str) -> int:
 
     exit_code = await process.wait()
     await _mark_job_as_finished(job_id, exit_code)
+    
     print(f"Job {job_id} terminou (exit={exit_code})")
     return exit_code
 
