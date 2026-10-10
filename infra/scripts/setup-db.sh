@@ -4,6 +4,8 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 
+dpkg --configure -a
+apt-get -f install -y
 apt-get update -y
 apt-get install -y mysql-server
 

@@ -42,8 +42,7 @@ Vagrant.configure("2") do |config|
 
     # dicionário de vms com as configurações de cada uma
     vms = {
-        "webserver" => { ip: "10.20.30.1", ram: 1024, cpus: 1 },
-        "sandbox"   => { ip: "10.20.30.2", ram: env_vars["SANDBOX_RAM"], cpus: 1 },
+        "webserver" => { ip: "10.20.30.1", ram: env_vars["SANDBOX_RAM"], cpus: 1 },
         "db"        => { ip: "10.20.30.3", ram: 1024, cpus: 1 }
     }
 
@@ -71,6 +70,8 @@ Vagrant.configure("2") do |config|
                 set -e
 
                 export DEBIAN_FRONTEND=noninteractive
+                dpkg --configure -a
+                apt-get -f install -y
                 apt-get update -y
                 apt-get install -y curl git netcat-openbsd
 

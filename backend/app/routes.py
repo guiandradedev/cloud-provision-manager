@@ -9,13 +9,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from .database import SessionLocal
-from .worker import run_job
+from .services.create_job import run_job
+from .services.create_env import create_env, CreateEnvironment
 
 router = APIRouter(tags=["jobs"])
 UPLOADS_DIR = Path("uploads")
 
 
-class CreateEnviromentRequest(BaseModel):
+class CreateEnvironmentRequest(BaseModel):
     name: str
 
 
@@ -26,20 +27,42 @@ class JobLogResponse(BaseModel):
 
 
 @router.post("/environment", status_code=status.HTTP_201_CREATED)
-async def create_environment(request: CreateEnviromentRequest) -> dict[str, str]:
+async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str]:
     env_id = str(uuid.uuid4())
 
-    async with SessionLocal() as session:
-        await session.execute(
-            text(
-                """
-                INSERT INTO environments (id, name, created_at)
-                VALUES (:env_id, :name, NOW())
-                """
-            ),
-            {"env_id": env_id, "name": request.name},
+    # async with SessionLocal() as session:
+    #     await session.execute(
+    #         text(
+    #             """
+    #             INSERT INTO environments (id, name, created_at)
+    #             VALUES (:env_id, :name, NOW())
+    #             """
+    #         ),
+    #         {"env_id": env_id, "name": request.name},
+    #     )
+    #     await session.commit()
+
+    env_data = CreateEnvironment(
+        name=request.name,
+        env_id=env_id,
+        cpu_quota=50, 
+        mem_limit=512,
+        cpu_weight=100,
+    )
+
+    try:
+        result = await create_env(env_data)
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not start environment: {error}",
+        ) from error
+
+    if result != 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create environment",
         )
-        await session.commit()
 
     return {"id": env_id, "name": request.name}
 

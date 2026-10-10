@@ -4,6 +4,8 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 
+dpkg --configure -a
+apt-get -f install -y
 apt-get update -y
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
@@ -39,8 +41,7 @@ netfilter-persistent save
 cd /home/application/provision-manager/frontend
 
 cat <<'EOF' > .env.production
-VITE_BACKEND_URL=/api
-VITE_REALTIME_GATEWAY_URL=http://localhost:8069
+VITE_API_URL=http://localhost:8069/api/
 EOF
 
 npm ci
@@ -88,6 +89,12 @@ EOF
 
 ln -sf /etc/nginx/sites-available/provision-manager /etc/nginx/sites-enabled/provision-manager
 rm -f /etc/nginx/sites-enabled/default
+
+# Setup backend
+
+## Inicia o cgroupsv2
+mount | grep cgroup2
+echo "+cpu +cpuset" > /sys/fs/cgroup/cgroup.subtree_control
 
 cd /home/application/provision-manager/backend
 

@@ -2,7 +2,7 @@ import asyncio
 
 from sqlalchemy import text
 
-from .database import SessionLocal
+from ..database import SessionLocal
 
 
 async def save_log(job_id: str, stream: str, message: str) -> None:
