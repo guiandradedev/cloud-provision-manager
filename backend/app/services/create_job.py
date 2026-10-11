@@ -26,24 +26,24 @@ async def read_stream(stream, job_id: str, stream_name: str) -> None:
 
 
 async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
-    cgroup_path = f"/sys/fs/cgroup/{env_cgroup_name}"
     safe_script = shlex.quote(script)
     
-    # CORREÇÃO: Escreve o PID ($$) na pasta do Cgroup do ambiente associado ANTES do unshare
+    # systemd-run garante a alocação do Cgroup com os limites de hardware
+    # unshare garante a execução do script num novo namespace isolado
     wrapper_cmd = (
-        f"echo $$ > {cgroup_path}/cgroup.procs && "
-        f"exec /usr/bin/unshare --mount --pid --fork --ipc --mount-proc bash -c {safe_script}"
+        f"exec systemd-run --scope --quiet "
+        f"--slice={env_cgroup_name}.slice "
+        f"-p CPUQuota=50% -p MemoryMax=512M "
+        f"/usr/bin/unshare --mount --pid --fork --ipc --mount-proc bash -c {safe_script}"
     )
 
     process = await asyncio.create_subprocess_exec(
-        "bash",
-        "-c",
-        wrapper_cmd,
+        "bash", "-c", wrapper_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     
-    print(f"Job {job_id} iniciado no Cgroup '{env_cgroup_name}' (PID={process.pid})")
+    print(f"Job {job_id} iniciado no ambiente '{env_cgroup_name}' (PID={process.pid})")
     await _mark_job_as_running(job_id, process.pid)
 
     await asyncio.gather(

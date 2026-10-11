@@ -97,11 +97,11 @@ mount | grep cgroup2
 echo "+cpu +cpuset" > /sys/fs/cgroup/cgroup.subtree_control
 
 cd /home/application/provision-manager/backend
+# !
+python3 -m venv /opt/venv
 
-python3 -m venv venv
-
-./venv/bin/pip install --upgrade pip
-./venv/bin/pip install -r requirements.txt
+/opt/venv/bin/pip install --upgrade pip
+/opt/venv/bin/pip install -r requirements.txt
 
 cat > /etc/systemd/system/provision-manager-backend.service <<EOT
 [Unit]
@@ -116,7 +116,8 @@ WorkingDirectory=/home/application/provision-manager/backend
 Environment="DATABASE_URL=mysql+aiomysql://${DB_USER}:${DB_PASS}@10.20.30.3:3306/mydb"
 ExecStartPre=/bin/sh -c 'until nc -z 10.20.30.3 3306; do sleep 2; done'
 TimeoutStartSec=infinity
-ExecStart=/home/application/provision-manager/backend/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8082
+# !
+ExecStart=/opt/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8082
 SuccessExitStatus=143
 Restart=always
 RestartSec=10
