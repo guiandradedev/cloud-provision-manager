@@ -24,6 +24,16 @@ class JobLogResponse(BaseModel):
     source: str
     content: str
     created_at: datetime
+    
+class ScriptResponse(BaseModel):
+    id: str
+    name: str
+    job_id: str
+    created_at: datetime
+
+
+class RerunScriptRequest(BaseModel):
+    env_id: str | None = None
 
 
 @router.post("/environment", status_code=status.HTTP_201_CREATED)
@@ -214,3 +224,124 @@ async def get_environment_jobs(env_id: str) -> list[dict[str, str]]:
         jobs = result.mappings().all()
 
     return [{"id": job["id"], "status": job["status"]} for job in jobs]
+
+@router.get("/environment/{env_id}/scripts", status_code=status.HTTP_200_OK)
+async def get_environment_scripts(env_id: str) -> list[ScriptResponse]:
+    """Lista todos os scripts já enviados e executados em um ambiente específico."""
+    async with SessionLocal() as session:
+        env_check = await session.execute(
+            text("SELECT id FROM environments WHERE id = :env_id"),
+            {"env_id": env_id},
+        )
+        if env_check.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail="Environment not found")
+
+        result = await session.execute(
+            text(
+                """
+                SELECT f.id, f.name, f.job_id, f.created_at
+                FROM files f
+                INNER JOIN jobs j ON f.job_id = j.id
+                WHERE j.env_id = :env_id
+                ORDER BY f.created_at DESC
+                """
+            ),
+            {"env_id": env_id},
+        )
+        scripts = result.mappings().all()
+
+    return [
+        ScriptResponse(
+            id=row["id"],
+            name=row["name"],
+            job_id=row["job_id"],
+            created_at=row["created_at"],
+        )
+        for row in scripts
+    ]
+
+
+@router.post("/scripts/{file_id}/run", status_code=status.HTTP_201_CREATED)
+async def rerun_script(
+    file_id: str,
+    request: RerunScriptRequest | None = None,
+) -> dict[str, str]:
+    """Reexecuta um script já armazenado criando um novo job."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT f.id, f.name, f.path, j.env_id AS original_env_id
+                FROM files f
+                INNER JOIN jobs j ON f.job_id = j.id
+                WHERE f.id = :file_id
+                """
+            ),
+            {"file_id": file_id},
+        )
+        script_row = result.mappings().one_or_none()
+
+        if script_row is None:
+            raise HTTPException(status_code=404, detail="Script not found")
+
+        target_env_id = (request.env_id if request and request.env_id else script_row["original_env_id"])
+
+        env_result = await session.execute(
+            text("SELECT name FROM environments WHERE id = :env_id"),
+            {"env_id": target_env_id},
+        )
+        env_name = env_result.scalar_one_or_none()
+        if env_name is None:
+            raise HTTPException(status_code=404, detail="Target environment not found")
+
+    file_path = Path(script_row["path"])
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Stored script file is missing from disk",
+        )
+
+    try:
+        script_content = file_path.read_text(encoding="utf-8")
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read stored script file",
+        ) from error
+
+    new_job_id = str(uuid.uuid4())
+    try:
+        async with SessionLocal.begin() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO jobs (id, status, env_id, created_at)
+                    VALUES (:job_id, 'queued', :env_id, NOW())
+                    """
+                ),
+                {"job_id": new_job_id, "env_id": target_env_id},
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO files (id, job_id, name, path, created_at)
+                    VALUES (:new_file_id, :job_id, :name, :path, NOW())
+                    """
+                ),
+                {
+                    "new_file_id": str(uuid.uuid4()),
+                    "job_id": new_job_id,
+                    "name": script_row["name"],
+                    "path": str(file_path),
+                },
+            )
+    except SQLAlchemyError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create the rerun job",
+        ) from error
+
+    cgroup_name = f"{env_name.replace(' ', '_').lower()}_{target_env_id[:8]}"
+    asyncio.create_task(run_job(new_job_id, script_content, cgroup_name))
+
+    return {"id": new_job_id, "status": "running"}
