@@ -94,7 +94,7 @@ rm -f /etc/nginx/sites-enabled/default
 
 ## Inicia o cgroupsv2
 mount | grep cgroup2
-echo "+cpu +cpuset" > /sys/fs/cgroup/cgroup.subtree_control
+echo "+cpu +cpuset +memory +io" > /sys/fs/cgroup/cgroup.subtree_control
 
 cd /home/application/provision-manager/backend
 # !
