@@ -18,6 +18,9 @@ UPLOADS_DIR = Path("uploads")
 
 class CreateEnvironmentRequest(BaseModel):
     name: str
+    cpu_quota: int
+    mem_limit: int
+    cpu_weight: int
 
 
 class JobLogResponse(BaseModel):
@@ -28,27 +31,42 @@ class JobLogResponse(BaseModel):
 
 @router.post("/environment", status_code=status.HTTP_201_CREATED)
 async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str]:
+    if not (1 <= request.cpu_quota <= 100):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="CPU quota must be between 1 and 100",
+        )
+    if not (1 <= request.mem_limit <= 16384):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Memory limit must be between 1 and 16384 MB",
+        )
+    if not (1 <= request.cpu_weight <= 1000):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="CPU weight must be between 1 and 1000",
+        )
+    
     env_id = str(uuid.uuid4())
     
-    # 1. DESCOMENTAR A INSERÇÃO NA BASE DE DADOS (obrigatório para o job achar o ambiente)
     async with SessionLocal() as session:
         await session.execute(
             text(
                 """
-                INSERT INTO environments (id, name, created_at)
-                VALUES (:env_id, :name, NOW())
+                INSERT INTO environments (id, name, cpu_quota, mem_limit, cpu_weight, created_at)
+                VALUES (:env_id, :name, :cpu_quota, :mem_limit, :cpu_weight, NOW())
                 """
             ),
-            {"env_id": env_id, "name": request.name},
+            {"env_id": env_id, "name": request.name, "cpu_quota": request.cpu_quota, "mem_limit": request.mem_limit, "cpu_weight": request.cpu_weight},
         )
         await session.commit()
 
     env_data = CreateEnvironment(
         name=request.name,
         env_id=env_id,
-        cpu_quota=50, 
-        mem_limit=512,
-        cpu_weight=100,
+        cpu_quota=request.cpu_quota, 
+        mem_limit=request.mem_limit,
+        cpu_weight=request.cpu_weight,
     )
     
     try:
@@ -75,7 +93,6 @@ async def create_job(
 ) -> dict[str, str]:
     job_id = str(uuid.uuid4())
 
-    # CORREÇÃO: Consulta o nome do ambiente correspondente ao ID submetido
     async with SessionLocal() as session:
         environment = await session.execute(
             text("SELECT name FROM environments WHERE id = :env_id"),

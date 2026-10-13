@@ -14,8 +14,6 @@ if [[ ! -d "$CGROUP" ]]; then
     exit 1
 fi
 
-# CORREÇÃO: Coloca o PID atual no Cgroup e mantém a sessão ativa de forma simples.
-# O isolamento via 'unshare' será injetado no momento da execução de cada job.
 echo "$$" > "$CGROUP/cgroup.procs"
 
 exec sleep infinity

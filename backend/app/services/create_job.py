@@ -35,7 +35,6 @@ def _get_namespace_holder_pid(cgroup_path: Path) -> int:
     if not pids:
         raise RuntimeError("Nenhum processo âncora ativo neste ambiente.")
 
-    # Procura especificamente o processo 'sleep' que detém os namespaces filhos
     for pid in pids:
         try:
             cmdline = Path(f"/proc/{pid}/cmdline").read_text()
@@ -44,7 +43,6 @@ def _get_namespace_holder_pid(cgroup_path: Path) -> int:
         except Exception:
             continue
 
-    # Fallback: ultimo PID criado no grupo
     return int(pids[-1])
 
 async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
@@ -59,8 +57,6 @@ async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
 
     safe_script = shlex.quote(script)
 
-    # Coloca o processo atual no cgroup
-    # Usa nsenter para entrar nos exatos mesmos namespaces do processo ancora (target_pid)
     wrapper_cmd = (
         f"echo $$ > {cgroup_path}/cgroup.procs && "
         f"exec /usr/bin/nsenter -t {target_pid} -m -u -i -p /bin/bash -c {safe_script}"
