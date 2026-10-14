@@ -13,6 +13,16 @@ const environmentLimits = {
   cpuWeight: { min: 1, max: 1000 },
 } as const;
 
+const pollingOptions = [
+  { label: "1s", value: 1_000 },
+  { label: "5s", value: 5_000 },
+  { label: "10s", value: 10_000 },
+  { label: "30s", value: 30_000 },
+  { label: "1min", value: 60_000 },
+  { label: "2min", value: 120_000 },
+  { label: "5min", value: 300_000 },
+] as const;
+
 export function meta({}: Route.MetaArgs) {
   return [
     { title: "Runway · Provision Manager" },
@@ -46,6 +56,8 @@ export default function Home() {
   const [cpuWeight, setCpuWeight] = useState("100");
   const [selectedEnvironment, setSelectedEnvironment] = useState("");
   const [script, setScript] = useState<File | null>(null);
+  const [pollingInterval, setPollingInterval] = useState<number | "custom">(5_000);
+  const [customPollingSeconds, setCustomPollingSeconds] = useState("15");
   const [showEnvironmentForm, setShowEnvironmentForm] = useState(false);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -84,12 +96,22 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!selectedJob) return;
-    void refreshJob(selectedJob);
-    if (!["queued", "running"].includes(selectedJob.status)) return;
-    const interval = window.setInterval(() => void refreshJob(selectedJob), 1800);
+    const selectedJobId = selectedJob?.id;
+    const selectedJobStatus = selectedJob?.status;
+    if (!selectedJobId) return;
+
+    const job = { id: selectedJobId, status: selectedJobStatus || "queued" };
+    void refreshJob(job);
+    if (!selectedJobStatus || !["queued", "running"].includes(selectedJobStatus)) return;
+
+    const customSeconds = Number(customPollingSeconds);
+    const safeCustomSeconds = Math.min(3_600, Math.max(1, Number.isFinite(customSeconds) ? customSeconds : 15));
+    const intervalMs = pollingInterval === "custom"
+      ? safeCustomSeconds * 1_000
+      : pollingInterval;
+    const interval = window.setInterval(() => void refreshJob(job), intervalMs);
     return () => window.clearInterval(interval);
-  }, [selectedJob, refreshJob]);
+  }, [selectedJob?.id, selectedJob?.status, refreshJob, pollingInterval, customPollingSeconds]);
 
   const runningJobs = useMemo(() => jobs.filter((job) => ["queued", "running"].includes(job.status)).length, [jobs]);
 
@@ -249,7 +271,7 @@ export default function Home() {
             {jobs.length === 0 ? <div className="empty-jobs">Jobs will appear here after your first dispatch.</div> : <div className="jobs-table"><div className="table-header"><span>Job ID</span><span>Status</span><span>Action</span></div>{jobs.map((job) => <button key={job.id} className={`job-row ${selectedJob?.id === job.id ? "selected" : ""}`} onClick={() => void refreshJob(job)}><span className="job-id"><i />{job.id.slice(0, 12)}…</span><StatusPill status={job.status} /><span className="view-job">View output ↗</span></button>)}</div>}
           </section>
 
-          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><StatusPill status={selectedJob.status} /></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
+          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><div className="terminal-heading-actions"><fieldset className="polling-control output-polling"><legend>Polling</legend><div className="polling-options" role="group" aria-label="Output polling interval">{pollingOptions.map((option) => <button key={option.value} type="button" className={`polling-option ${pollingInterval === option.value ? "selected" : ""}`} aria-pressed={pollingInterval === option.value} onClick={() => setPollingInterval(option.value)}>{option.label}</button>)}<button type="button" className={`polling-option ${pollingInterval === "custom" ? "selected" : ""}`} aria-pressed={pollingInterval === "custom"} onClick={() => setPollingInterval("custom")}>Custom</button></div>{pollingInterval === "custom" && <label className="custom-polling-field" htmlFor="custom-polling-seconds"><span>Every</span><input id="custom-polling-seconds" type="number" min="1" max="3600" step="1" value={customPollingSeconds} onChange={(event) => setCustomPollingSeconds(event.target.value)} /><span>seconds</span></label>}<small className="polling-note">Output checks · min 1s · max 1h</small></fieldset><StatusPill status={selectedJob.status} /></div></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
         </div>
       </section>
     </main>

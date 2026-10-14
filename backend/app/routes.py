@@ -1,4 +1,5 @@
 import asyncio
+from unittest import result
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -184,6 +185,44 @@ async def get_job_output(
         for log in logs
     ]
     return {"id": job_id, "output": output}
+
+@router.get("/jobs/{job_id}/script", status_code=status.HTTP_200_OK)
+async def get_job_script(job_id: str) -> dict[str, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text("SELECT path FROM files WHERE job_id = :job_id"),
+            {"job_id": job_id},
+        )        
+        job_script = result.scalar_one_or_none()
+
+    if job_script is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Retornar o conteúdo do script em vez do caminho do arquivo
+    try:
+        with open(job_script, "r", encoding="utf-8") as f:
+            job_script = f.read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Script file not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading script file: {str(e)}")
+
+    return {"id": job_id, "script": job_script}
+
+@router.get("/jobs/{job_id}/status", status_code=status.HTTP_200_OK)
+async def get_job_status(job_id: str) -> dict[str, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text("SELECT status FROM jobs WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        job_status = result.scalar_one_or_none()
+
+    if job_status is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {"id": job_id, "status": job_status}
+
 
 @router.get("/jobs", status_code=status.HTTP_200_OK)
 async def get_jobs() -> list[dict[str, str]]:
