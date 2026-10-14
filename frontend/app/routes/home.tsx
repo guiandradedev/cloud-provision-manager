@@ -6,6 +6,7 @@ const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:3001").replac
 type Environment = { id: string; name: string };
 type Job = { id: string; status: string };
 type Log = { source: string; content: string; created_at: string };
+type Script = { id: string; name: string; job_id: string; created_at: string };
 
 const environmentLimits = {
   cpuQuota: { min: 1, max: 100 },
@@ -48,6 +49,7 @@ function StatusPill({ status }: { status: string }) {
 export default function Home() {
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [scripts, setScripts] = useState<Script[]>([]);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [logs, setLogs] = useState<Log[]>([]);
   const [environmentName, setEnvironmentName] = useState("");
@@ -60,6 +62,13 @@ export default function Home() {
   const [customPollingSeconds, setCustomPollingSeconds] = useState("15");
   const [showEnvironmentForm, setShowEnvironmentForm] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [scriptsLoading, setScriptsLoading] = useState(false);
+  const [rerunningScriptId, setRerunningScriptId] = useState<string | null>(null);
+  const [rerunTargetScript, setRerunTargetScript] = useState<Script | null>(null);
+  const [rerunTargetEnvironment, setRerunTargetEnvironment] = useState("");
+  const [scriptViewer, setScriptViewer] = useState<Script | null>(null);
+  const [scriptContent, setScriptContent] = useState("");
+  const [scriptViewerLoading, setScriptViewerLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<{ type: "error" | "success"; text: string } | null>(null);
 
@@ -80,6 +89,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => { void loadData(); }, [loadData]);
+
+  const loadScripts = useCallback(async (environmentId: string) => {
+    setScriptsLoading(true);
+    try {
+      const scriptData = await request<Script[]>(`/environment/${environmentId}/scripts`);
+      setScripts(scriptData);
+    } catch (error) {
+      setScripts([]);
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível carregar os scripts." });
+    } finally {
+      setScriptsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedEnvironment) {
+      setScripts([]);
+      return;
+    }
+    void loadScripts(selectedEnvironment);
+  }, [selectedEnvironment, loadScripts]);
 
   const refreshJob = useCallback(async (job: Job) => {
     try {
@@ -189,12 +219,66 @@ export default function Home() {
       const created = await request<Job>("/jobs", { method: "POST", body: formData });
       setJobs((current) => [created, ...current]);
       setSelectedJob(created);
+      void loadScripts(selectedEnvironment);
       setScript(null);
       (event.currentTarget as HTMLFormElement).reset();
       setMessage({ type: "success", text: "Job enviado. Acompanhe a execução no terminal." });
     } catch (error) {
       setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível enviar o script." });
     } finally { setSubmitting(false); }
+  }
+
+  async function rerunScript(scriptToRun: Script, targetEnvironmentId: string) {
+    if (!targetEnvironmentId) return;
+    setRerunningScriptId(scriptToRun.id);
+    try {
+      const created = await request<Job>(`/scripts/${scriptToRun.id}/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ env_id: targetEnvironmentId }),
+      });
+      setJobs((current) => [created, ...current]);
+      setSelectedJob(created);
+      if (targetEnvironmentId === selectedEnvironment) {
+        await loadScripts(selectedEnvironment);
+      }
+      const targetEnvironmentName = environments.find((environment) => environment.id === targetEnvironmentId)?.name;
+      setMessage({ type: "success", text: `${scriptToRun.name} was queued in ${targetEnvironmentName || "the selected environment"}.` });
+    } catch (error) {
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível reexecutar o script." });
+    } finally {
+      setRerunningScriptId(null);
+    }
+  }
+
+  function openRerunDialog(scriptToRun: Script) {
+    const otherEnvironment = environments.find((environment) => environment.id !== selectedEnvironment);
+    setRerunTargetScript(scriptToRun);
+    setRerunTargetEnvironment(otherEnvironment?.id || "");
+  }
+
+  async function confirmRerunInOtherEnvironment(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!rerunTargetScript || !rerunTargetEnvironment) return;
+    const scriptToRun = rerunTargetScript;
+    const targetEnvironmentId = rerunTargetEnvironment;
+    setRerunTargetScript(null);
+    await rerunScript(scriptToRun, targetEnvironmentId);
+  }
+
+  async function viewScript(scriptToView: Script) {
+    setScriptViewer(scriptToView);
+    setScriptContent("");
+    setScriptViewerLoading(true);
+    try {
+      const response = await request<{ id: string; script: string }>(`/jobs/${scriptToView.job_id}/script`);
+      setScriptContent(response.script);
+    } catch (error) {
+      setScriptViewer(null);
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível carregar o código do script." });
+    } finally {
+      setScriptViewerLoading(false);
+    }
   }
 
   return (
@@ -266,12 +350,21 @@ export default function Home() {
             </section>
           </div>
 
+          <section className="panel scripts-panel" id="scripts">
+            <div className="panel-heading"><div><span className="section-kicker">03 / library</span><h2>Saved scripts</h2></div><span className="muted">{selectedEnvironment ? `${scripts.length} in selected environment` : "Select an environment"}</span></div>
+            {!selectedEnvironment ? <div className="empty-jobs">Select an environment to browse its saved scripts.</div> : scriptsLoading ? <div className="empty-jobs">Loading saved scripts…</div> : scripts.length === 0 ? <div className="empty-jobs">Scripts will appear here after the first dispatch.</div> : <div className="scripts-list">{scripts.map((savedScript) => <div className="script-row" key={savedScript.id}><div className="script-info"><span className="script-icon">SH</span><div><strong>{savedScript.name}</strong><small>Job {savedScript.job_id.slice(0, 8)}… · {new Date(savedScript.created_at).toLocaleString()}</small></div></div><div className="script-actions"><button className="button button-dark script-action" type="button" disabled={rerunningScriptId !== null} onClick={() => void rerunScript(savedScript, selectedEnvironment)}>{rerunningScriptId === savedScript.id ? "Running…" : "Run here"}</button><button className="button button-quiet script-action" type="button" disabled={rerunningScriptId !== null} onClick={() => openRerunDialog(savedScript)}>Other env.</button><button className="button button-quiet script-action" type="button" onClick={() => void viewScript(savedScript)}>View code</button></div></div>)}</div>}
+          </section>
+
           <section className="panel jobs-panel">
-            <div className="panel-heading"><div><span className="section-kicker">03 / activity</span><h2>Recent jobs</h2></div><span className="muted">{jobs.length} total</span></div>
+            <div className="panel-heading"><div><span className="section-kicker">04 / activity</span><h2>Recent jobs</h2></div><span className="muted">{jobs.length} total</span></div>
             {jobs.length === 0 ? <div className="empty-jobs">Jobs will appear here after your first dispatch.</div> : <div className="jobs-table"><div className="table-header"><span>Job ID</span><span>Status</span><span>Action</span></div>{jobs.map((job) => <button key={job.id} className={`job-row ${selectedJob?.id === job.id ? "selected" : ""}`} onClick={() => void refreshJob(job)}><span className="job-id"><i />{job.id.slice(0, 12)}…</span><StatusPill status={job.status} /><span className="view-job">View output ↗</span></button>)}</div>}
           </section>
 
           {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><div className="terminal-heading-actions"><fieldset className="polling-control output-polling"><legend>Polling</legend><div className="polling-options" role="group" aria-label="Output polling interval">{pollingOptions.map((option) => <button key={option.value} type="button" className={`polling-option ${pollingInterval === option.value ? "selected" : ""}`} aria-pressed={pollingInterval === option.value} onClick={() => setPollingInterval(option.value)}>{option.label}</button>)}<button type="button" className={`polling-option ${pollingInterval === "custom" ? "selected" : ""}`} aria-pressed={pollingInterval === "custom"} onClick={() => setPollingInterval("custom")}>Custom</button></div>{pollingInterval === "custom" && <label className="custom-polling-field" htmlFor="custom-polling-seconds"><span>Every</span><input id="custom-polling-seconds" type="number" min="1" max="3600" step="1" value={customPollingSeconds} onChange={(event) => setCustomPollingSeconds(event.target.value)} /><span>seconds</span></label>}<small className="polling-note">Output checks · min 1s · max 1h</small></fieldset><StatusPill status={selectedJob.status} /></div></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
+
+          {rerunTargetScript && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setRerunTargetScript(null); }}><form className="modal" role="dialog" aria-modal="true" aria-labelledby="rerun-dialog-title" onSubmit={confirmRerunInOtherEnvironment}><div className="modal-header"><div><span className="section-kicker">Run elsewhere</span><h2 id="rerun-dialog-title">Choose an environment</h2></div><button className="modal-close" type="button" aria-label="Close" onClick={() => setRerunTargetScript(null)}>×</button></div><div className="modal-body"><p>Select where <strong>{rerunTargetScript.name}</strong> should run.</p>{environments.filter((environment) => environment.id !== selectedEnvironment).length === 0 ? <p className="modal-empty">There is no other environment available.</p> : <select value={rerunTargetEnvironment} onChange={(event) => setRerunTargetEnvironment(event.target.value)} aria-label="Target environment"><option value="">Select an environment</option>{environments.filter((environment) => environment.id !== selectedEnvironment).map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}</select>}</div><div className="modal-footer"><button className="button button-quiet" type="button" onClick={() => setRerunTargetScript(null)}>Cancel</button><button className="button button-lime" type="submit" disabled={!rerunTargetEnvironment || rerunningScriptId !== null}>Run script ↗</button></div></form></div>}
+
+          {scriptViewer && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScriptViewer(null); }}><section className="modal script-modal" role="dialog" aria-modal="true" aria-labelledby="script-viewer-title"><div className="modal-header"><div><span className="section-kicker">Saved script</span><h2 id="script-viewer-title">{scriptViewer.name}</h2></div><button className="modal-close" type="button" aria-label="Close" onClick={() => setScriptViewer(null)}>×</button></div><div className="modal-body script-viewer-body">{scriptViewerLoading ? <div className="modal-empty">Loading script…</div> : <pre className="script-code"><code>{scriptContent}</code></pre>}</div><div className="modal-footer"><span className="modal-meta">Original job {scriptViewer.job_id.slice(0, 8)}…</span><button className="button button-dark" type="button" onClick={() => setScriptViewer(null)}>Close</button></div></section></div>}
         </div>
       </section>
     </main>
