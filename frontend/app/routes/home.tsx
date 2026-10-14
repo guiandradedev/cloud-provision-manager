@@ -7,8 +7,20 @@ type Environment = { id: string; name: string };
 type Job = { id: string; status: string };
 type Log = { source: string; content: string; created_at: string };
 
-const environmentFields = [
-  { key: "name", label: "Nome do ambiente", placeholder: "ex.: staging-blue", type: "text" },
+const environmentLimits = {
+  cpuQuota: { min: 1, max: 100 },
+  memory: { min: 1, max: 16384 },
+  cpuWeight: { min: 1, max: 1000 },
+} as const;
+
+const pollingOptions = [
+  { label: "1s", value: 1_000 },
+  { label: "5s", value: 5_000 },
+  { label: "10s", value: 10_000 },
+  { label: "30s", value: 30_000 },
+  { label: "1min", value: 60_000 },
+  { label: "2min", value: 120_000 },
+  { label: "5min", value: 300_000 },
 ] as const;
 
 export function meta({}: Route.MetaArgs) {
@@ -39,8 +51,13 @@ export default function Home() {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [logs, setLogs] = useState<Log[]>([]);
   const [environmentName, setEnvironmentName] = useState("");
+  const [cpuQuota, setCpuQuota] = useState("50");
+  const [memoryLimit, setMemoryLimit] = useState("512");
+  const [cpuWeight, setCpuWeight] = useState("100");
   const [selectedEnvironment, setSelectedEnvironment] = useState("");
   const [script, setScript] = useState<File | null>(null);
+  const [pollingInterval, setPollingInterval] = useState<number | "custom">(5_000);
+  const [customPollingSeconds, setCustomPollingSeconds] = useState("15");
   const [showEnvironmentForm, setShowEnvironmentForm] = useState(false);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -79,28 +96,81 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!selectedJob) return;
-    void refreshJob(selectedJob);
-    if (!["queued", "running"].includes(selectedJob.status)) return;
-    const interval = window.setInterval(() => void refreshJob(selectedJob), 1800);
+    const selectedJobId = selectedJob?.id;
+    const selectedJobStatus = selectedJob?.status;
+    if (!selectedJobId) return;
+
+    const job = { id: selectedJobId, status: selectedJobStatus || "queued" };
+    void refreshJob(job);
+    if (!selectedJobStatus || !["queued", "running"].includes(selectedJobStatus)) return;
+
+    const customSeconds = Number(customPollingSeconds);
+    const safeCustomSeconds = Math.min(3_600, Math.max(1, Number.isFinite(customSeconds) ? customSeconds : 15));
+    const intervalMs = pollingInterval === "custom"
+      ? safeCustomSeconds * 1_000
+      : pollingInterval;
+    const interval = window.setInterval(() => void refreshJob(job), intervalMs);
     return () => window.clearInterval(interval);
-  }, [selectedJob, refreshJob]);
+  }, [selectedJob?.id, selectedJob?.status, refreshJob, pollingInterval, customPollingSeconds]);
 
   const runningJobs = useMemo(() => jobs.filter((job) => ["queued", "running"].includes(job.status)).length, [jobs]);
 
   async function createEnvironment(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!environmentName.trim()) return;
+    const cpuQuotaValue = Number(cpuQuota);
+    const memoryLimitValue = Number(memoryLimit);
+    const cpuWeightValue = Number(cpuWeight);
+
+    if (!environmentName.trim()) {
+      setMessage({ type: "error", text: "Give the environment a name." });
+      return;
+    }
+
+    if (
+      !Number.isInteger(cpuQuotaValue) ||
+      cpuQuotaValue < environmentLimits.cpuQuota.min ||
+      cpuQuotaValue > environmentLimits.cpuQuota.max
+    ) {
+      setMessage({ type: "error", text: "CPU limit must be an integer between 1% and 100%." });
+      return;
+    }
+
+    if (
+      !Number.isInteger(memoryLimitValue) ||
+      memoryLimitValue < environmentLimits.memory.min ||
+      memoryLimitValue > environmentLimits.memory.max
+    ) {
+      setMessage({ type: "error", text: "Memory limit must be an integer between 1 MB and 16384 MB." });
+      return;
+    }
+
+    if (
+      !Number.isInteger(cpuWeightValue) ||
+      cpuWeightValue < environmentLimits.cpuWeight.min ||
+      cpuWeightValue > environmentLimits.cpuWeight.max
+    ) {
+      setMessage({ type: "error", text: "CPU weight must be an integer between 1 and 1000." });
+      return;
+    }
+
     setSubmitting(true);
     try {
       const created = await request<Environment>("/environment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: environmentName.trim() }),
+        body: JSON.stringify({
+          name: environmentName.trim(),
+          cpu_quota: cpuQuotaValue,
+          mem_limit: memoryLimitValue,
+          cpu_weight: cpuWeightValue,
+        }),
       });
       setEnvironments((current) => [...current, created]);
       setSelectedEnvironment(created.id);
       setEnvironmentName("");
+      setCpuQuota("50");
+      setMemoryLimit("512");
+      setCpuWeight("100");
       setShowEnvironmentForm(false);
       setMessage({ type: "success", text: "Ambiente criado e pronto para receber jobs." });
     } catch (error) {
@@ -158,7 +228,30 @@ export default function Home() {
           <div className="main-grid">
             <section className="panel environments-panel" id="environments">
               <div className="panel-heading"><div><span className="section-kicker">01 / spaces</span><h2>Environments</h2></div><button className="button button-dark" onClick={() => setShowEnvironmentForm((value) => !value)}>+ New environment</button></div>
-              {showEnvironmentForm && <form className="inline-form" onSubmit={createEnvironment}><label htmlFor="environment-name">{environmentFields[0].label}</label><div className="form-row"><input id="environment-name" value={environmentName} onChange={(event) => setEnvironmentName(event.target.value)} placeholder={environmentFields[0].placeholder} autoFocus /><button className="button button-lime" disabled={submitting}>{submitting ? "Creating…" : "Create"}</button></div></form>}
+              {showEnvironmentForm && <form className="inline-form" onSubmit={createEnvironment}>
+                <div className="environment-form-grid">
+                  <div className="field field-wide">
+                    <label htmlFor="environment-name">Environment name</label>
+                    <input id="environment-name" value={environmentName} onChange={(event) => setEnvironmentName(event.target.value)} placeholder="e.g. staging-blue" autoFocus />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="cpu-quota">CPU limit <span>(%)</span></label>
+                    <input id="cpu-quota" type="number" min={environmentLimits.cpuQuota.min} max={environmentLimits.cpuQuota.max} step="1" value={cpuQuota} onChange={(event) => setCpuQuota(event.target.value)} />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="memory-limit">Memory <span>(MB)</span></label>
+                    <input id="memory-limit" type="number" min={environmentLimits.memory.min} max={environmentLimits.memory.max} step="1" value={memoryLimit} onChange={(event) => setMemoryLimit(event.target.value)} />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="cpu-weight">CPU weight</label>
+                    <input id="cpu-weight" type="number" min={environmentLimits.cpuWeight.min} max={environmentLimits.cpuWeight.max} step="1" value={cpuWeight} onChange={(event) => setCpuWeight(event.target.value)} />
+                  </div>
+                </div>
+                <div className="environment-form-footer">
+                  <p>CPU 1–100% · memory 1–16384 MB · weight 1–1000</p>
+                  <button className="button button-lime" disabled={submitting}>{submitting ? "Creating…" : "Create"}</button>
+                </div>
+              </form>}
               {loading ? <div className="empty-state">Loading workspace…</div> : environments.length === 0 ? <div className="empty-state"><div className="empty-icon">⌁</div><strong>No environments yet</strong><span>Create your first space to start running scripts.</span><button className="text-button" onClick={() => setShowEnvironmentForm(true)}>Create an environment <span>↗</span></button></div> : <div className="environment-list">{environments.map((environment, index) => <button key={environment.id} className={`environment-row ${selectedEnvironment === environment.id ? "selected" : ""}`} onClick={() => setSelectedEnvironment(environment.id)}><span className="env-number">{String(index + 1).padStart(2, "0")}</span><span className="env-icon">⌂</span><span className="env-name">{environment.name}</span><span className="env-id">{environment.id.slice(0, 8)}</span><span className="row-arrow">↗</span></button>)}</div>}
             </section>
 
@@ -178,7 +271,7 @@ export default function Home() {
             {jobs.length === 0 ? <div className="empty-jobs">Jobs will appear here after your first dispatch.</div> : <div className="jobs-table"><div className="table-header"><span>Job ID</span><span>Status</span><span>Action</span></div>{jobs.map((job) => <button key={job.id} className={`job-row ${selectedJob?.id === job.id ? "selected" : ""}`} onClick={() => void refreshJob(job)}><span className="job-id"><i />{job.id.slice(0, 12)}…</span><StatusPill status={job.status} /><span className="view-job">View output ↗</span></button>)}</div>}
           </section>
 
-          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><StatusPill status={selectedJob.status} /></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
+          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><div className="terminal-heading-actions"><fieldset className="polling-control output-polling"><legend>Polling</legend><div className="polling-options" role="group" aria-label="Output polling interval">{pollingOptions.map((option) => <button key={option.value} type="button" className={`polling-option ${pollingInterval === option.value ? "selected" : ""}`} aria-pressed={pollingInterval === option.value} onClick={() => setPollingInterval(option.value)}>{option.label}</button>)}<button type="button" className={`polling-option ${pollingInterval === "custom" ? "selected" : ""}`} aria-pressed={pollingInterval === "custom"} onClick={() => setPollingInterval("custom")}>Custom</button></div>{pollingInterval === "custom" && <label className="custom-polling-field" htmlFor="custom-polling-seconds"><span>Every</span><input id="custom-polling-seconds" type="number" min="1" max="3600" step="1" value={customPollingSeconds} onChange={(event) => setCustomPollingSeconds(event.target.value)} /><span>seconds</span></label>}<small className="polling-note">Output checks · min 1s · max 1h</small></fieldset><StatusPill status={selectedJob.status} /></div></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
         </div>
       </section>
     </main>
