@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,16 +8,19 @@ from .config import settings
 from .database import engine
 from .migrations import run_migrations
 from .routes import router
-import os
+from .services.create_job import shutdown_scheduled_jobs
+from .services.reconcile import reconcile_runtime_state
 
 os.mkdir("uploads") if not os.path.exists("uploads") else None
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await run_migrations(engine)
+    await reconcile_runtime_state()
     try:
         yield
     finally:
+        await shutdown_scheduled_jobs()
         await engine.dispose()
 
 

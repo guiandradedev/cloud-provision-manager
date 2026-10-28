@@ -1,9 +1,15 @@
 import asyncio
-import os
-from pathlib import Path
 from pydantic import BaseModel
 
-CGROUPS_DIR = Path("/sys/fs/cgroup")
+from .runtime import (
+    CGROUPS_DIR,
+    EnvironmentRuntime,
+    cleanup_environment_cgroup,
+    configure_environment_cgroup,
+    environment_cgroup_name,
+    environment_cgroup_path,
+    find_environment_anchor,
+)
 
 class CreateEnvironment(BaseModel):
     env_id: str
@@ -12,24 +18,37 @@ class CreateEnvironment(BaseModel):
     cpu_weight: int
     mem_limit: int
 
-async def create_env(env: CreateEnvironment) -> int:
-    cgroup_name = f"{env.name.replace(' ', '_').lower()}_{env.env_id[:8]}"
-    cgroup_path = CGROUPS_DIR / cgroup_name
+async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
+    cgroup_name = environment_cgroup_name(env.name, env.env_id)
+    cgroup_path = environment_cgroup_path(cgroup_name)
+    cgroup_existed = cgroup_path.exists()
 
     try:
-        Path("/sys/fs/cgroup/cgroup.subtree_control").write_text("+cpu +memory +io")
+        (CGROUPS_DIR / "cgroup.subtree_control").write_text("+cpu +memory +io")
     except Exception:
         pass
 
     cgroup_path.mkdir(parents=True, exist_ok=True)
+    configure_environment_cgroup(
+        cgroup_path,
+        cpu_quota=env.cpu_quota,
+        cpu_weight=env.cpu_weight,
+        mem_limit=env.mem_limit,
+    )
 
-    period = 100_000
-    quota = (env.cpu_quota * period) // 100
-    memory_bytes = env.mem_limit * 1024 * 1024
+    anchor_pid = find_environment_anchor(cgroup_path)
+    if anchor_pid is not None:
+        return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
 
-    (cgroup_path / "cpu.max").write_text(f"{quota} {period}\n")
-    (cgroup_path / "cpu.weight").write_text(f"{env.cpu_weight}\n")
-    (cgroup_path / "memory.max").write_text(f"{memory_bytes}\n")
+    if cgroup_existed:
+        await cleanup_environment_cgroup(cgroup_name)
+        cgroup_path.mkdir(parents=True, exist_ok=False)
+        configure_environment_cgroup(
+            cgroup_path,
+            cpu_quota=env.cpu_quota,
+            cpu_weight=env.cpu_weight,
+            mem_limit=env.mem_limit,
+        )
 
     hostname = cgroup_name.replace("_", "-")[:63]
     cmd = (
@@ -41,12 +60,18 @@ async def create_env(env: CreateEnvironment) -> int:
     proc = await asyncio.create_subprocess_exec(
         "bash", "-c", cmd,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.DEVNULL,
     )
 
-    await asyncio.sleep(0.3)
-    if proc.returncode is not None and proc.returncode != 0:
-        err = (await proc.stderr.read()).decode(errors="replace")
-        raise RuntimeError(f"Erro ao criar namespace: {err}")
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        anchor_pid = find_environment_anchor(cgroup_path)
+        if anchor_pid is not None:
+            return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
+        if proc.returncode is not None:
+            break
 
-    return 0
+    await cleanup_environment_cgroup(cgroup_name)
+    raise RuntimeError(
+        f"Namespace anchor did not start (exit={proc.returncode})"
+    )

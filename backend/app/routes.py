@@ -1,5 +1,3 @@
-import asyncio
-from unittest import result
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -10,8 +8,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from .database import SessionLocal
-from .services.create_job import run_job
+from .services.create_job import schedule_job
 from .services.create_env import create_env, CreateEnvironment
+from .services.runtime import (
+    cleanup_environment_cgroup,
+    environment_cgroup_name,
+)
 
 router = APIRouter(tags=["jobs"])
 UPLOADS_DIR = Path("uploads")
@@ -59,18 +61,7 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
         )
     
     env_id = str(uuid.uuid4())
-    
-    async with SessionLocal() as session:
-        await session.execute(
-            text(
-                """
-                INSERT INTO environments (id, name, cpu_quota, mem_limit, cpu_weight, created_at)
-                VALUES (:env_id, :name, :cpu_quota, :mem_limit, :cpu_weight, NOW())
-                """
-            ),
-            {"env_id": env_id, "name": request.name, "cpu_quota": request.cpu_quota, "mem_limit": request.mem_limit, "cpu_weight": request.cpu_weight},
-        )
-        await session.commit()
+    cgroup_name = environment_cgroup_name(request.name, env_id)
 
     env_data = CreateEnvironment(
         name=request.name,
@@ -81,20 +72,57 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
     )
     
     try:
-        result = await create_env(env_data)
-    except (RuntimeError, ValueError) as error:
+        async with SessionLocal.begin() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO environments (
+                        id, name, cpu_quota, mem_limit, cpu_weight,
+                        status, cgroup_name, created_at
+                    )
+                    VALUES (
+                        :env_id, :name, :cpu_quota, :mem_limit, :cpu_weight,
+                        'pending', :cgroup_name, NOW()
+                    )
+                    """
+                ),
+                {
+                    "env_id": env_id,
+                    "name": request.name,
+                    "cpu_quota": request.cpu_quota,
+                    "mem_limit": request.mem_limit,
+                    "cpu_weight": request.cpu_weight,
+                    "cgroup_name": cgroup_name,
+                },
+            )
+
+            runtime = await create_env(env_data)
+            await session.execute(
+                text(
+                    """
+                    UPDATE environments
+                    SET status = 'running', anchor_pid = :anchor_pid,
+                        cgroup_name = :cgroup_name, error_message = NULL
+                    WHERE id = :env_id
+                    """
+                ),
+                {
+                    "env_id": env_id,
+                    "anchor_pid": runtime.anchor_pid,
+                    "cgroup_name": runtime.cgroup_name,
+                },
+            )
+    except Exception as error:
+        try:
+            await cleanup_environment_cgroup(cgroup_name)
+        except OSError:
+            pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Could not start environment: {error}",
         ) from error
 
-    if result != 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not create environment",
-        )
-
-    return {"id": env_id, "name": request.name}
+    return {"id": env_id, "name": request.name, "status": "running"}
 
 
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
@@ -106,12 +134,23 @@ async def create_job(
 
     async with SessionLocal() as session:
         environment = await session.execute(
-            text("SELECT name FROM environments WHERE id = :env_id"),
+            text(
+                """
+                SELECT name, status, cgroup_name
+                FROM environments
+                WHERE id = :env_id
+                """
+            ),
             {"env_id": env_id},
         )
-        env_name = environment.scalar_one_or_none()
-        if not env_name:
+        environment_row = environment.mappings().one_or_none()
+        if environment_row is None:
             raise HTTPException(status_code=404, detail="Environment not found")
+        if environment_row["status"] != "running":
+            raise HTTPException(
+                status_code=409,
+                detail="Environment is not ready to run jobs",
+            )
 
     if not script.filename or not script.filename.endswith(".sh"):
         raise HTTPException(status_code=400, detail="Invalid script file type")
@@ -141,11 +180,13 @@ async def create_job(
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Could not create the job") from error
 
-    # CORREÇÃO: Reconstrói a nomenclatura exata do Cgroup (igual ao create_env.py) e passa para o Job
-    cgroup_name = env_name.replace(" ", "_").lower() + f"_{env_id[:8]}"
-    asyncio.create_task(run_job(job_id, script_content, cgroup_name))
+    cgroup_name = environment_row["cgroup_name"] or environment_cgroup_name(
+        environment_row["name"],
+        env_id,
+    )
+    schedule_job(job_id, script_content, cgroup_name)
 
-    return {"id": job_id, "status": "running"}
+    return {"id": job_id, "status": "queued"}
 
 @router.get("/jobs/{job_id}", status_code=status.HTTP_200_OK)
 async def get_job_status(job_id: str) -> dict[str, str]:
@@ -245,16 +286,28 @@ async def get_jobs() -> list[dict[str, str]]:
 @router.get("/environment", status_code=status.HTTP_200_OK)
 async def get_environments() -> list[dict[str, str]]:
     async with SessionLocal() as session:
-        result = await session.execute(text("SELECT id, name FROM environments"))
+        result = await session.execute(
+            text("SELECT id, name, status FROM environments")
+        )
         environments = result.fetchall()
 
-    return [{"id": env.id, "name": env.name} for env in environments]
+    return [
+        {"id": env.id, "name": env.name, "status": env.status}
+        for env in environments
+    ]
 
 @router.get("/environment/{env_id}", status_code=status.HTTP_200_OK)
-async def get_environment(env_id: str) -> dict[str, str]:
+async def get_environment(env_id: str) -> dict[str, str | int | None]:
     async with SessionLocal() as session:
         result = await session.execute(
-            text("SELECT id, name FROM environments WHERE id = :env_id"),
+            text(
+                """
+                SELECT id, name, status, cpu_quota, mem_limit, cpu_weight,
+                       anchor_pid, error_message
+                FROM environments
+                WHERE id = :env_id
+                """
+            ),
             {"env_id": env_id},
         )
         environment = result.mappings().one_or_none()
@@ -262,7 +315,7 @@ async def get_environment(env_id: str) -> dict[str, str]:
     if environment is None:
         raise HTTPException(status_code=404, detail="Environment not found")
 
-    return {"id": environment["id"], "name": environment["name"]}
+    return dict(environment)
 
 @router.get("/environment/{env_id}/jobs", status_code=status.HTTP_200_OK)
 async def get_environment_jobs(env_id: str) -> list[dict[str, str]]:
@@ -343,12 +396,23 @@ async def rerun_script(
         target_env_id = (request.env_id if request and request.env_id else script_row["original_env_id"])
 
         env_result = await session.execute(
-            text("SELECT name FROM environments WHERE id = :env_id"),
+            text(
+                """
+                SELECT name, status, cgroup_name
+                FROM environments
+                WHERE id = :env_id
+                """
+            ),
             {"env_id": target_env_id},
         )
-        env_name = env_result.scalar_one_or_none()
-        if env_name is None:
+        env_row = env_result.mappings().one_or_none()
+        if env_row is None:
             raise HTTPException(status_code=404, detail="Target environment not found")
+        if env_row["status"] != "running":
+            raise HTTPException(
+                status_code=409,
+                detail="Target environment is not ready to run jobs",
+            )
 
     file_path = Path(script_row["path"])
     if not file_path.exists():
@@ -397,7 +461,10 @@ async def rerun_script(
             detail="Could not create the rerun job",
         ) from error
 
-    cgroup_name = f"{env_name.replace(' ', '_').lower()}_{target_env_id[:8]}"
-    asyncio.create_task(run_job(new_job_id, script_content, cgroup_name))
+    cgroup_name = env_row["cgroup_name"] or environment_cgroup_name(
+        env_row["name"],
+        target_env_id,
+    )
+    schedule_job(new_job_id, script_content, cgroup_name)
 
-    return {"id": new_job_id, "status": "running"}
+    return {"id": new_job_id, "status": "queued"}
