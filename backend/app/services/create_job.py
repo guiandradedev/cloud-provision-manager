@@ -72,7 +72,7 @@ async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
 
         wrapper_cmd = (
             f"echo $$ > {job_cgroup_path}/cgroup.procs && "
-            f"exec /usr/bin/nsenter -t {target_pid} -m -u -i -p "
+            f"exec /usr/bin/nsenter -t {target_pid} -m -u -i -p -n "
             f"/bin/bash -c {safe_script}"
         )
 

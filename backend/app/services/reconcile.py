@@ -67,7 +67,7 @@ async def _restore_environments() -> None:
         result = await session.execute(
             text(
                 """
-                SELECT id, name, cpu_quota, mem_limit, cpu_weight
+                SELECT id, name, cpu_quota, mem_limit, cpu_weight, io_limit_bps
                 FROM environments
                 """
             )
@@ -81,6 +81,7 @@ async def _restore_environments() -> None:
             cpu_quota=environment["cpu_quota"],
             mem_limit=environment["mem_limit"],
             cpu_weight=environment["cpu_weight"],
+            io_limit_bps=environment["io_limit_bps"],
         )
 
         try:

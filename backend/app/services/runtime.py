@@ -44,6 +44,7 @@ def configure_environment_cgroup(
     cpu_quota: int,
     cpu_weight: int,
     mem_limit: int,
+    io_limit_bps: int = 0,
 ) -> None:
     period = 100_000
     quota = (cpu_quota * period) // 100
@@ -52,6 +53,34 @@ def configure_environment_cgroup(
     (cgroup_path / "cpu.max").write_text(f"{quota} {period}\n")
     (cgroup_path / "cpu.weight").write_text(f"{cpu_weight}\n")
     (cgroup_path / "memory.max").write_text(f"{memory_bytes}\n")
+    if io_limit_bps > 0:
+        device = os.stat("/").st_dev
+        major, minor = os.major(device), os.minor(device)
+        (cgroup_path / "io.max").write_text(
+            f"{major}:{minor} rbps={io_limit_bps} wbps={io_limit_bps}\n"
+        )
+
+
+async def configure_network_namespace(anchor_pid: int) -> None:
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/nsenter",
+        "-t",
+        str(anchor_pid),
+        "-n",
+        "ip",
+        "link",
+        "set",
+        "lo",
+        "up",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(
+            "Could not enable namespace loopback: "
+            f"{stderr.decode(errors='replace').strip()}"
+        )
 
 
 def find_environment_anchor(cgroup_path: Path) -> int | None:
@@ -66,6 +95,15 @@ def find_environment_anchor(cgroup_path: Path) -> int | None:
             return pid
 
     return None
+
+
+def has_isolated_network_namespace(anchor_pid: int) -> bool:
+    try:
+        host_namespace = os.stat("/proc/self/ns/net").st_ino
+        environment_namespace = os.stat(f"/proc/{anchor_pid}/ns/net").st_ino
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    return environment_namespace != host_namespace
 
 
 def read_cgroup_pids(cgroup_path: Path) -> list[int]:

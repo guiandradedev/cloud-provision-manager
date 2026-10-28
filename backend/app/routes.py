@@ -24,6 +24,7 @@ class CreateEnvironmentRequest(BaseModel):
     cpu_quota: int
     mem_limit: int
     cpu_weight: int
+    io_limit_bps: int = 0
 
 
 class JobLogResponse(BaseModel):
@@ -59,6 +60,11 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="CPU weight must be between 1 and 1000",
         )
+    if request.io_limit_bps < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="I/O limit must be zero or a positive number of bytes per second",
+        )
     
     env_id = str(uuid.uuid4())
     cgroup_name = environment_cgroup_name(request.name, env_id)
@@ -69,6 +75,7 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
         cpu_quota=request.cpu_quota, 
         mem_limit=request.mem_limit,
         cpu_weight=request.cpu_weight,
+        io_limit_bps=request.io_limit_bps,
     )
     
     try:
@@ -77,11 +84,11 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
                 text(
                     """
                     INSERT INTO environments (
-                        id, name, cpu_quota, mem_limit, cpu_weight,
+                        id, name, cpu_quota, mem_limit, cpu_weight, io_limit_bps,
                         status, cgroup_name, created_at
                     )
                     VALUES (
-                        :env_id, :name, :cpu_quota, :mem_limit, :cpu_weight,
+                        :env_id, :name, :cpu_quota, :mem_limit, :cpu_weight, :io_limit_bps,
                         'pending', :cgroup_name, NOW()
                     )
                     """
@@ -92,6 +99,7 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
                     "cpu_quota": request.cpu_quota,
                     "mem_limit": request.mem_limit,
                     "cpu_weight": request.cpu_weight,
+                    "io_limit_bps": request.io_limit_bps,
                     "cgroup_name": cgroup_name,
                 },
             )
@@ -303,6 +311,7 @@ async def get_environment(env_id: str) -> dict[str, str | int | None]:
             text(
                 """
                 SELECT id, name, status, cpu_quota, mem_limit, cpu_weight,
+                       io_limit_bps,
                        anchor_pid, error_message
                 FROM environments
                 WHERE id = :env_id

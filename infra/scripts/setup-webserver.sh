@@ -22,7 +22,18 @@ EOF
 
 sysctl -p /etc/sysctl.d/99-provision-manager-gateway.conf
 
-WAN_IF=$(ip route show default | awk '{print $5; exit}')
+WAN_IF=""
+
+for _ in $(seq 1 30); do
+    WAN_IF=$(ip route show default | awk '{print $5; exit}')
+    [ -n "$WAN_IF" ] && break
+    sleep 1
+done
+
+if [ -z "$WAN_IF" ]; then
+    echo "Não foi possível identificar a interface NAT pela rota padrão." >&2
+    exit 1
+fi
 
 # Encaminha o DNS recebido em 10.20.30.1 para o DNS do NAT do VirtualBox.
 iptables -t nat -C PREROUTING -d 10.20.30.1 -p udp --dport 53 -j DNAT --to-destination 10.0.2.3 2>/dev/null || \
@@ -112,6 +123,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
+IOAccounting=yes
 WorkingDirectory=/home/application/provision-manager/backend
 Environment="DATABASE_URL=mysql+aiomysql://${DB_USER}:${DB_PASS}@10.20.30.3:3306/mydb"
 ExecStartPre=/bin/sh -c 'until nc -z 10.20.30.3 3306; do sleep 2; done'

@@ -6,9 +6,11 @@ from .runtime import (
     EnvironmentRuntime,
     cleanup_environment_cgroup,
     configure_environment_cgroup,
+    configure_network_namespace,
     environment_cgroup_name,
     environment_cgroup_path,
     find_environment_anchor,
+    has_isolated_network_namespace,
 )
 
 class CreateEnvironment(BaseModel):
@@ -17,6 +19,7 @@ class CreateEnvironment(BaseModel):
     cpu_quota: int
     cpu_weight: int
     mem_limit: int
+    io_limit_bps: int = 0
 
 async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
     cgroup_name = environment_cgroup_name(env.name, env.env_id)
@@ -34,10 +37,12 @@ async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
         cpu_quota=env.cpu_quota,
         cpu_weight=env.cpu_weight,
         mem_limit=env.mem_limit,
+        io_limit_bps=env.io_limit_bps,
     )
 
     anchor_pid = find_environment_anchor(cgroup_path)
-    if anchor_pid is not None:
+    if anchor_pid is not None and has_isolated_network_namespace(anchor_pid):
+        await configure_network_namespace(anchor_pid)
         return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
 
     if cgroup_existed:
@@ -48,12 +53,13 @@ async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
             cpu_quota=env.cpu_quota,
             cpu_weight=env.cpu_weight,
             mem_limit=env.mem_limit,
+            io_limit_bps=env.io_limit_bps,
         )
 
     hostname = cgroup_name.replace("_", "-")[:63]
     cmd = (
         f"echo $$ > {cgroup_path}/cgroup.procs && "
-        f"exec /usr/bin/unshare --mount --pid --fork --uts --ipc --mount-proc "
+        f"exec /usr/bin/unshare --mount --pid --fork --uts --ipc --net --mount-proc "
         f"/bin/bash -c 'hostname {hostname}; exec sleep infinity'"
     )
 
@@ -67,6 +73,7 @@ async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
         await asyncio.sleep(0.05)
         anchor_pid = find_environment_anchor(cgroup_path)
         if anchor_pid is not None:
+            await configure_network_namespace(anchor_pid)
             return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
         if proc.returncode is not None:
             break
