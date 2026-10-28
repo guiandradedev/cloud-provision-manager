@@ -10,17 +10,20 @@ from .runtime import (
     prepare_job_cgroup,
 )
 
-_job_tasks: set[asyncio.Task[int]] = set()
+_job_tasks: dict[str, asyncio.Task[int]] = {}
 
 
 def schedule_job(job_id: str, script: str, env_cgroup_name: str) -> None:
     task = asyncio.create_task(run_job(job_id, script, env_cgroup_name))
-    _job_tasks.add(task)
-    task.add_done_callback(_finish_scheduled_job)
+    _job_tasks[job_id] = task
+    task.add_done_callback(
+        lambda completed_task: _finish_scheduled_job(job_id, completed_task)
+    )
 
 
-def _finish_scheduled_job(task: asyncio.Task[int]) -> None:
-    _job_tasks.discard(task)
+def _finish_scheduled_job(job_id: str, task: asyncio.Task[int]) -> None:
+    if _job_tasks.get(job_id) is task:
+        _job_tasks.pop(job_id, None)
     if task.cancelled():
         return
     error = task.exception()
@@ -29,11 +32,21 @@ def _finish_scheduled_job(task: asyncio.Task[int]) -> None:
 
 
 async def shutdown_scheduled_jobs() -> None:
-    tasks = list(_job_tasks)
+    tasks = list(_job_tasks.values())
     for task in tasks:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def cancel_scheduled_job(job_id: str) -> bool:
+    task = _job_tasks.get(job_id)
+    if task is None:
+        return False
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    return True
 
 
 async def save_log(job_id: str, stream: str, message: str) -> None:
@@ -108,9 +121,9 @@ async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
         await save_log(
             job_id,
             "stderr",
-            "Execução interrompida durante o desligamento do backend.",
+            "Execução interrompida.",
         )
-        await _mark_job_as_finished(job_id, 143)
+        await _mark_job_as_terminated(job_id)
         raise
     except Exception as error:
         await save_log(job_id, "stderr", f"Erro de execução: {error}")
@@ -122,8 +135,6 @@ async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
                 process.kill()
             except ProcessLookupError:
                 pass
-            else:
-                await process.wait()
         if job_runtime_created:
             try:
                 await cleanup_job_cgroup(env_cgroup_name, job_id)
@@ -133,6 +144,8 @@ async def run_job(job_id: str, script: str, env_cgroup_name: str) -> int:
                     "stderr",
                     f"Não foi possível limpar o cgroup do job: {error}",
                 )
+        if process is not None and process.returncode is None:
+            await process.wait()
 
 async def _mark_job_as_running(
     job_id: str,
@@ -163,5 +176,21 @@ async def _mark_job_as_finished(job_id: str, exit_code: int) -> None:
         await session.execute(
             text("UPDATE jobs SET status = :status, exit_code = :exit_code, finished_at = NOW() WHERE id = :job_id"),
             {"job_id": job_id, "status": final_status, "exit_code": exit_code},
+        )
+        await session.commit()
+
+
+async def _mark_job_as_terminated(job_id: str) -> None:
+    async with SessionLocal() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE jobs
+                SET status = 'terminated', exit_code = 143,
+                    pid = NULL, finished_at = NOW()
+                WHERE id = :job_id
+                """
+            ),
+            {"job_id": job_id},
         )
         await session.commit()

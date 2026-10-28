@@ -2,16 +2,17 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from .database import SessionLocal
-from .services.create_job import schedule_job
+from .services.create_job import cancel_scheduled_job, schedule_job
 from .services.create_env import create_env, CreateEnvironment
 from .services.runtime import (
     cleanup_environment_cgroup,
+    cleanup_job_cgroup,
     environment_cgroup_name,
 )
 
@@ -210,6 +211,60 @@ async def get_job_status(job_id: str) -> dict[str, str]:
 
     return {"id": job_id, "status": job_status}
 
+
+@router.post("/jobs/{job_id}/terminate", status_code=status.HTTP_200_OK)
+async def terminate_job(job_id: str) -> dict[str, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT j.status, e.id AS env_id, e.name AS env_name,
+                       e.cgroup_name
+                FROM jobs j
+                INNER JOIN environments e ON e.id = j.env_id
+                WHERE j.id = :job_id
+                """
+            ),
+            {"job_id": job_id},
+        )
+        job = result.mappings().one_or_none()
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "terminated":
+        return {"id": job_id, "status": "terminated"}
+    if job["status"] not in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Job is not active")
+
+    cancelled = await cancel_scheduled_job(job_id)
+    if not cancelled:
+        cgroup_name = job["cgroup_name"] or environment_cgroup_name(
+            job["env_name"],
+            job["env_id"],
+        )
+        try:
+            await cleanup_job_cgroup(cgroup_name, job_id)
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not terminate job: {error}",
+            ) from error
+
+    async with SessionLocal.begin() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE jobs
+                SET status = 'terminated', exit_code = 143,
+                    pid = NULL, finished_at = NOW()
+                WHERE id = :job_id AND status IN ('queued', 'running')
+                """
+            ),
+            {"job_id": job_id},
+        )
+
+    return {"id": job_id, "status": "terminated"}
+
 @router.get("/jobs/{job_id}/output", status_code=status.HTTP_200_OK)
 async def get_job_output(
     job_id: str,
@@ -325,6 +380,129 @@ async def get_environment(env_id: str) -> dict[str, str | int | None]:
         raise HTTPException(status_code=404, detail="Environment not found")
 
     return dict(environment)
+
+
+@router.delete(
+    "/environment/{env_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_environment(env_id: str) -> Response:
+    async with SessionLocal.begin() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT name, cgroup_name
+                FROM environments
+                WHERE id = :env_id
+                """
+            ),
+            {"env_id": env_id},
+        )
+        environment = result.mappings().one_or_none()
+        if environment is None:
+            raise HTTPException(status_code=404, detail="Environment not found")
+
+        await session.execute(
+            text("UPDATE environments SET status = 'deleting' WHERE id = :env_id"),
+            {"env_id": env_id},
+        )
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT id
+                FROM jobs
+                WHERE env_id = :env_id AND status IN ('queued', 'running')
+                """
+            ),
+            {"env_id": env_id},
+        )
+        active_job_ids = result.scalars().all()
+
+    for active_job_id in active_job_ids:
+        await cancel_scheduled_job(active_job_id)
+
+    cgroup_name = environment["cgroup_name"] or environment_cgroup_name(
+        environment["name"],
+        env_id,
+    )
+    try:
+        await cleanup_environment_cgroup(cgroup_name)
+    except OSError as error:
+        async with SessionLocal.begin() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE environments
+                    SET status = 'error', error_message = :error
+                    WHERE id = :env_id
+                    """
+                ),
+                {"env_id": env_id, "error": str(error)},
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not remove environment: {error}",
+        ) from error
+
+    unreferenced_files: set[str] = set()
+    async with SessionLocal.begin() as session:
+        file_result = await session.execute(
+            text(
+                """
+                SELECT DISTINCT f.path
+                FROM files f
+                INNER JOIN jobs j ON j.id = f.job_id
+                WHERE j.env_id = :env_id
+                """
+            ),
+            {"env_id": env_id},
+        )
+        file_paths = file_result.scalars().all()
+
+        await session.execute(
+            text(
+                """
+                DELETE FROM job_logs
+                WHERE job_id IN (SELECT id FROM jobs WHERE env_id = :env_id)
+                """
+            ),
+            {"env_id": env_id},
+        )
+        await session.execute(
+            text(
+                """
+                DELETE FROM files
+                WHERE job_id IN (SELECT id FROM jobs WHERE env_id = :env_id)
+                """
+            ),
+            {"env_id": env_id},
+        )
+        await session.execute(
+            text("DELETE FROM jobs WHERE env_id = :env_id"),
+            {"env_id": env_id},
+        )
+        await session.execute(
+            text("DELETE FROM environments WHERE id = :env_id"),
+            {"env_id": env_id},
+        )
+
+        for file_path in file_paths:
+            reference = await session.execute(
+                text("SELECT 1 FROM files WHERE path = :path LIMIT 1"),
+                {"path": file_path},
+            )
+            if reference.scalar_one_or_none() is None:
+                unreferenced_files.add(file_path)
+
+    for file_path in unreferenced_files:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError as error:
+            print(f"Could not remove uploaded file {file_path}: {error}")
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get("/environment/{env_id}/jobs", status_code=status.HTTP_200_OK)
 async def get_environment_jobs(env_id: str) -> list[dict[str, str]]:
