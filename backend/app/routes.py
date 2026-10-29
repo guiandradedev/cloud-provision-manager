@@ -17,7 +17,7 @@ from .services.runtime import (
     environment_cgroup_name,
     environment_cgroup_path,
 )
-from .services.storage import job_output_path, script_path
+from .services.storage import script_path
 
 router = APIRouter(tags=["jobs"])
 
@@ -463,30 +463,35 @@ async def update_environment(
     if environment is None:
         raise HTTPException(status_code=404, detail="Environment not found")
 
-    if environment["status"] == "running":
-        cgroup_name = environment["cgroup_name"] or environment_cgroup_name(
-            environment["name"],
-            env_id,
+    if environment["status"] != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Environment is not running",
         )
-        cgroup_path = environment_cgroup_path(cgroup_name)
-        if not cgroup_path.exists():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Environment runtime is not available",
-            )
-        try:
-            configure_environment_cgroup(
-                cgroup_path,
-                cpu_quota=request.cpu_quota,
-                mem_limit=request.mem_limit,
-                cpu_weight=request.cpu_weight,
-                io_limit_bps=request.io_limit_bps,
-            )
-        except OSError as error:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Could not update environment limits: {error}",
-            ) from error
+
+    cgroup_name = environment["cgroup_name"] or environment_cgroup_name(
+        environment["name"],
+        env_id,
+    )
+    cgroup_path = environment_cgroup_path(cgroup_name)
+    if not cgroup_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Environment runtime is not available",
+        )
+    try:
+        configure_environment_cgroup(
+            cgroup_path,
+            cpu_quota=request.cpu_quota,
+            mem_limit=request.mem_limit,
+            cpu_weight=request.cpu_weight,
+            io_limit_bps=request.io_limit_bps,
+        )
+    except OSError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not update environment limits: {error}",
+        ) from error
 
     async with SessionLocal.begin() as session:
         await session.execute(
@@ -516,12 +521,12 @@ async def update_environment(
     "/environment/{env_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-async def delete_environment(env_id: str) -> Response:
+async def terminate_environment(env_id: str) -> Response:
     async with SessionLocal.begin() as session:
         result = await session.execute(
             text(
                 """
-                SELECT name, cgroup_name
+                SELECT name, status, cgroup_name
                 FROM environments
                 WHERE id = :env_id
                 """
@@ -531,6 +536,8 @@ async def delete_environment(env_id: str) -> Response:
         environment = result.mappings().one_or_none()
         if environment is None:
             raise HTTPException(status_code=404, detail="Environment not found")
+        if environment["status"] == "terminated":
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
 
         await session.execute(
             text("UPDATE environments SET status = 'deleting' WHERE id = :env_id"),
@@ -573,34 +580,17 @@ async def delete_environment(env_id: str) -> Response:
             )
         raise HTTPException(
             status_code=500,
-            detail=f"Could not remove environment: {error}",
+            detail=f"Could not terminate environment: {error}",
         ) from error
 
-    unreferenced_files: set[str] = set()
     async with SessionLocal.begin() as session:
-        file_result = await session.execute(
-            text(
-                """
-                SELECT DISTINCT f.path
-                FROM files f
-                INNER JOIN jobs j ON j.id = f.job_id
-                WHERE j.env_id = :env_id
-                """
-            ),
-            {"env_id": env_id},
-        )
-        file_paths = file_result.scalars().all()
-        job_result = await session.execute(
-            text("SELECT id FROM jobs WHERE env_id = :env_id"),
-            {"env_id": env_id},
-        )
-        job_ids = job_result.scalars().all()
-
         await session.execute(
             text(
                 """
-                DELETE FROM job_logs
-                WHERE job_id IN (SELECT id FROM jobs WHERE env_id = :env_id)
+                UPDATE jobs
+                SET status = 'terminated', exit_code = 143,
+                    pid = NULL, finished_at = NOW()
+                WHERE env_id = :env_id AND status IN ('queued', 'running')
                 """
             ),
             {"env_id": env_id},
@@ -608,40 +598,14 @@ async def delete_environment(env_id: str) -> Response:
         await session.execute(
             text(
                 """
-                DELETE FROM files
-                WHERE job_id IN (SELECT id FROM jobs WHERE env_id = :env_id)
+                UPDATE environments
+                SET status = 'terminated', anchor_pid = NULL,
+                    error_message = NULL
+                WHERE id = :env_id
                 """
             ),
             {"env_id": env_id},
         )
-        await session.execute(
-            text("DELETE FROM jobs WHERE env_id = :env_id"),
-            {"env_id": env_id},
-        )
-        await session.execute(
-            text("DELETE FROM environments WHERE id = :env_id"),
-            {"env_id": env_id},
-        )
-
-        for file_path in file_paths:
-            reference = await session.execute(
-                text("SELECT 1 FROM files WHERE path = :path LIMIT 1"),
-                {"path": file_path},
-            )
-            if reference.scalar_one_or_none() is None:
-                unreferenced_files.add(file_path)
-
-    for file_path in unreferenced_files:
-        try:
-            Path(file_path).unlink(missing_ok=True)
-        except OSError as error:
-            print(f"Could not remove uploaded file {file_path}: {error}")
-    for job_id in job_ids:
-        output_path = job_output_path(job_id)
-        try:
-            output_path.unlink(missing_ok=True)
-        except OSError as error:
-            print(f"Could not remove output file {output_path}: {error}")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
