@@ -13,7 +13,9 @@ from .services.create_env import create_env, CreateEnvironment
 from .services.runtime import (
     cleanup_environment_cgroup,
     cleanup_job_cgroup,
+    configure_environment_cgroup,
     environment_cgroup_name,
+    environment_cgroup_path,
 )
 from .services.storage import job_output_path, script_path
 
@@ -22,6 +24,13 @@ router = APIRouter(tags=["jobs"])
 
 class CreateEnvironmentRequest(BaseModel):
     name: str
+    cpu_quota: int
+    mem_limit: int
+    cpu_weight: int
+    io_limit_bps: int = 0
+
+
+class UpdateEnvironmentRequest(BaseModel):
     cpu_quota: int
     mem_limit: int
     cpu_weight: int
@@ -44,8 +53,9 @@ class RerunScriptRequest(BaseModel):
     env_id: str | None = None
 
 
-@router.post("/environment", status_code=status.HTTP_201_CREATED)
-async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str]:
+def validate_environment_limits(
+    request: CreateEnvironmentRequest | UpdateEnvironmentRequest,
+) -> None:
     if not (1 <= request.cpu_quota <= 100):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -66,6 +76,11 @@ async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="I/O limit must be zero or a positive number of bytes per second",
         )
+
+
+@router.post("/environment", status_code=status.HTTP_201_CREATED)
+async def create_environment(request: CreateEnvironmentRequest) -> dict[str, str]:
+    validate_environment_limits(request)
     
     env_id = str(uuid.uuid4())
     cgroup_name = environment_cgroup_name(request.name, env_id)
@@ -173,6 +188,7 @@ async def create_job(
         raise HTTPException(status_code=400, detail="Script must be a valid UTF-8 text file") from error
 
     file_path.write_bytes(contents)
+    file_id = str(uuid.uuid4())
 
     try:
         async with SessionLocal.begin() as session:
@@ -182,7 +198,7 @@ async def create_job(
             )
             await session.execute(
                 text("INSERT INTO files (id, job_id, name, path, created_at) VALUES (:file_id, :job_id, :name, :path, NOW())"),
-                {"file_id": str(uuid.uuid4()), "job_id": job_id, "name": script.filename, "path": str(file_path)},
+                {"file_id": file_id, "job_id": job_id, "name": script.filename, "path": str(file_path)},
             )
     except SQLAlchemyError as error:
         file_path.unlink(missing_ok=True)
@@ -194,21 +210,37 @@ async def create_job(
     )
     schedule_job(job_id, script_content, cgroup_name)
 
-    return {"id": job_id, "status": "queued"}
+    return {
+        "id": job_id,
+        "status": "queued",
+        "env_id": env_id,
+        "env_name": environment_row["name"],
+        "script_id": file_id,
+        "script_name": script.filename,
+    }
 
 @router.get("/jobs/{job_id}", status_code=status.HTTP_200_OK)
 async def get_job_status(job_id: str) -> dict[str, str]:
     async with SessionLocal() as session:
         result = await session.execute(
-            text("SELECT status FROM jobs WHERE id = :job_id"),
+            text(
+                """
+                SELECT j.status, j.env_id, e.name AS env_name,
+                       f.id AS script_id, f.name AS script_name
+                FROM jobs j
+                INNER JOIN environments e ON e.id = j.env_id
+                LEFT JOIN files f ON f.job_id = j.id
+                WHERE j.id = :job_id
+                """
+            ),
             {"job_id": job_id},
         )
-        job_status = result.scalar_one_or_none()
+        job = result.mappings().one_or_none()
 
-    if job_status is None:
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    return {"id": job_id, "status": job_status}
+    return {"id": job_id, **dict(job)}
 
 
 @router.post("/jobs/{job_id}/terminate", status_code=status.HTTP_200_OK)
@@ -218,9 +250,11 @@ async def terminate_job(job_id: str) -> dict[str, str]:
             text(
                 """
                 SELECT j.status, e.id AS env_id, e.name AS env_name,
-                       e.cgroup_name
+                       e.cgroup_name, f.id AS script_id,
+                       f.name AS script_name
                 FROM jobs j
                 INNER JOIN environments e ON e.id = j.env_id
+                LEFT JOIN files f ON f.job_id = j.id
                 WHERE j.id = :job_id
                 """
             ),
@@ -231,7 +265,14 @@ async def terminate_job(job_id: str) -> dict[str, str]:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] == "terminated":
-        return {"id": job_id, "status": "terminated"}
+        return {
+            "id": job_id,
+            "status": "terminated",
+            "env_id": job["env_id"],
+            "env_name": job["env_name"],
+            "script_id": job["script_id"],
+            "script_name": job["script_name"],
+        }
     if job["status"] not in {"queued", "running"}:
         raise HTTPException(status_code=409, detail="Job is not active")
 
@@ -262,7 +303,14 @@ async def terminate_job(job_id: str) -> dict[str, str]:
             {"job_id": job_id},
         )
 
-    return {"id": job_id, "status": "terminated"}
+    return {
+        "id": job_id,
+        "status": "terminated",
+        "env_id": job["env_id"],
+        "env_name": job["env_name"],
+        "script_id": job["script_id"],
+        "script_name": job["script_name"],
+    }
 
 @router.get("/jobs/{job_id}/output", status_code=status.HTTP_200_OK)
 async def get_job_output(
@@ -340,10 +388,21 @@ async def get_job_status(job_id: str) -> dict[str, str]:
 @router.get("/jobs", status_code=status.HTTP_200_OK)
 async def get_jobs() -> list[dict[str, str]]:
     async with SessionLocal() as session:
-        result = await session.execute(text("SELECT id, status FROM jobs"))
-        jobs = result.fetchall()
+        result = await session.execute(
+            text(
+                """
+                SELECT j.id, j.status, j.env_id, e.name AS env_name,
+                       f.id AS script_id, f.name AS script_name
+                FROM jobs j
+                INNER JOIN environments e ON e.id = j.env_id
+                LEFT JOIN files f ON f.job_id = j.id
+                ORDER BY j.created_at DESC
+                """
+            )
+        )
+        jobs = result.mappings().all()
 
-    return [{"id": job.id, "status": job.status} for job in jobs]
+    return [dict(job) for job in jobs]
 
 @router.get("/environment", status_code=status.HTTP_200_OK)
 async def get_environments() -> list[dict[str, str]]:
@@ -379,6 +438,78 @@ async def get_environment(env_id: str) -> dict[str, str | int | None]:
         raise HTTPException(status_code=404, detail="Environment not found")
 
     return dict(environment)
+
+
+@router.patch("/environment/{env_id}", status_code=status.HTTP_200_OK)
+async def update_environment(
+    env_id: str,
+    request: UpdateEnvironmentRequest,
+) -> dict[str, str | int | None]:
+    validate_environment_limits(request)
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT id, name, status, cgroup_name
+                FROM environments
+                WHERE id = :env_id
+                """
+            ),
+            {"env_id": env_id},
+        )
+        environment = result.mappings().one_or_none()
+
+    if environment is None:
+        raise HTTPException(status_code=404, detail="Environment not found")
+
+    if environment["status"] == "running":
+        cgroup_name = environment["cgroup_name"] or environment_cgroup_name(
+            environment["name"],
+            env_id,
+        )
+        cgroup_path = environment_cgroup_path(cgroup_name)
+        if not cgroup_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Environment runtime is not available",
+            )
+        try:
+            configure_environment_cgroup(
+                cgroup_path,
+                cpu_quota=request.cpu_quota,
+                mem_limit=request.mem_limit,
+                cpu_weight=request.cpu_weight,
+                io_limit_bps=request.io_limit_bps,
+            )
+        except OSError as error:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Could not update environment limits: {error}",
+            ) from error
+
+    async with SessionLocal.begin() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE environments
+                SET cpu_quota = :cpu_quota,
+                    mem_limit = :mem_limit,
+                    cpu_weight = :cpu_weight,
+                    io_limit_bps = :io_limit_bps
+                WHERE id = :env_id
+                """
+            ),
+            {
+                "env_id": env_id,
+                "cpu_quota": request.cpu_quota,
+                "mem_limit": request.mem_limit,
+                "cpu_weight": request.cpu_weight,
+                "io_limit_bps": request.io_limit_bps,
+            },
+        )
+
+    return await get_environment(env_id)
 
 
 @router.delete(
@@ -520,16 +651,20 @@ async def get_environment_jobs(env_id: str) -> list[dict[str, str]]:
         result = await session.execute(
             text(
                 """
-                SELECT id, status
-                FROM jobs
-                WHERE env_id = :env_id
+                SELECT j.id, j.status, j.env_id, e.name AS env_name,
+                       f.id AS script_id, f.name AS script_name
+                FROM jobs j
+                INNER JOIN environments e ON e.id = j.env_id
+                LEFT JOIN files f ON f.job_id = j.id
+                WHERE j.env_id = :env_id
+                ORDER BY j.created_at DESC
                 """
             ),
             {"env_id": env_id},
         )
         jobs = result.mappings().all()
 
-    return [{"id": job["id"], "status": job["status"]} for job in jobs]
+    return [dict(job) for job in jobs]
 
 @router.get("/environment/{env_id}/scripts", status_code=status.HTTP_200_OK)
 async def get_environment_scripts(env_id: str) -> list[ScriptResponse]:
@@ -545,11 +680,19 @@ async def get_environment_scripts(env_id: str) -> list[ScriptResponse]:
         result = await session.execute(
             text(
                 """
-                SELECT f.id, f.name, f.job_id, f.created_at
-                FROM files f
-                INNER JOIN jobs j ON f.job_id = j.id
-                WHERE j.env_id = :env_id
-                ORDER BY f.created_at DESC
+                SELECT id, name, job_id, created_at
+                FROM (
+                    SELECT f.id, f.name, f.job_id, f.created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY f.path
+                               ORDER BY f.created_at, f.id
+                           ) AS position
+                    FROM files f
+                    INNER JOIN jobs j ON f.job_id = j.id
+                    WHERE j.env_id = :env_id
+                ) saved_scripts
+                WHERE position = 1
+                ORDER BY created_at DESC
                 """
             ),
             {"env_id": env_id},
@@ -627,6 +770,7 @@ async def rerun_script(
         ) from error
 
     new_job_id = str(uuid.uuid4())
+    new_file_id = str(uuid.uuid4())
     try:
         async with SessionLocal.begin() as session:
             await session.execute(
@@ -646,7 +790,7 @@ async def rerun_script(
                     """
                 ),
                 {
-                    "new_file_id": str(uuid.uuid4()),
+                    "new_file_id": new_file_id,
                     "job_id": new_job_id,
                     "name": script_row["name"],
                     "path": str(file_path),
@@ -664,4 +808,11 @@ async def rerun_script(
     )
     schedule_job(new_job_id, script_content, cgroup_name)
 
-    return {"id": new_job_id, "status": "queued"}
+    return {
+        "id": new_job_id,
+        "status": "queued",
+        "env_id": target_env_id,
+        "env_name": env_row["name"],
+        "script_id": new_file_id,
+        "script_name": script_row["name"],
+    }

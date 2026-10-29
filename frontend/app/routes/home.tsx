@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router";
 import type { Route } from "./+types/home";
 
 const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:3001").replace(/\/$/, "");
 
-type Environment = { id: string; name: string };
-type Job = { id: string; status: string };
+type Environment = { id: string; name: string; status: string };
+type Job = { id: string; status: string; env_id: string; env_name: string; script_id: string; script_name: string };
 type Log = { source: string; content: string; created_at: string };
 type Script = { id: string; name: string; job_id: string; created_at: string };
 
@@ -12,6 +13,7 @@ const environmentLimits = {
   cpuQuota: { min: 1, max: 100 },
   memory: { min: 1, max: 16384 },
   cpuWeight: { min: 1, max: 1000 },
+  ioMegabytes: { min: 0 },
 } as const;
 
 const pollingOptions = [
@@ -37,12 +39,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `A API respondeu com ${response.status}`);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
-function StatusPill({ status }: { status: string }) {
+function StatusPill({ status, environment = false }: { status: string; environment?: boolean }) {
   const normalized = status.toLowerCase();
-  const label = normalized === "completed" ? "concluído" : normalized === "failed" ? "falhou" : normalized === "running" ? "executando" : "na fila";
+  const label = normalized === "completed" ? "concluído" : normalized === "failed" ? "falhou" : normalized === "error" ? "erro" : normalized === "running" ? (environment ? "ativo" : "executando") : normalized === "terminated" ? "encerrado" : normalized === "deleting" ? "removendo" : normalized === "pending" ? "pendente" : "na fila";
   return <span className={`status status-${normalized}`}><i />{label}</span>;
 }
 
@@ -56,6 +59,7 @@ export default function Home() {
   const [cpuQuota, setCpuQuota] = useState("50");
   const [memoryLimit, setMemoryLimit] = useState("512");
   const [cpuWeight, setCpuWeight] = useState("100");
+  const [ioLimit, setIoLimit] = useState("0");
   const [selectedEnvironment, setSelectedEnvironment] = useState("");
   const [script, setScript] = useState<File | null>(null);
   const [pollingInterval, setPollingInterval] = useState<number | "custom">(5_000);
@@ -70,6 +74,8 @@ export default function Home() {
   const [scriptContent, setScriptContent] = useState("");
   const [scriptViewerLoading, setScriptViewerLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [deletingEnvironment, setDeletingEnvironment] = useState(false);
+  const [terminatingJobId, setTerminatingJobId] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: "error" | "success"; text: string } | null>(null);
 
   const loadData = useCallback(async () => {
@@ -130,7 +136,7 @@ export default function Home() {
     const selectedJobStatus = selectedJob?.status;
     if (!selectedJobId) return;
 
-    const job = { id: selectedJobId, status: selectedJobStatus || "queued" };
+    const job = { ...selectedJob, id: selectedJobId, status: selectedJobStatus || "queued" };
     void refreshJob(job);
     if (!selectedJobStatus || !["queued", "running"].includes(selectedJobStatus)) return;
 
@@ -144,12 +150,14 @@ export default function Home() {
   }, [selectedJob?.id, selectedJob?.status, refreshJob, pollingInterval, customPollingSeconds]);
 
   const runningJobs = useMemo(() => jobs.filter((job) => ["queued", "running"].includes(job.status)).length, [jobs]);
+  const runningEnvironments = useMemo(() => environments.filter((environment) => environment.status === "running").length, [environments]);
 
   async function createEnvironment(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const cpuQuotaValue = Number(cpuQuota);
     const memoryLimitValue = Number(memoryLimit);
     const cpuWeightValue = Number(cpuWeight);
+    const ioLimitValue = Number(ioLimit);
 
     if (!environmentName.trim()) {
       setMessage({ type: "error", text: "Give the environment a name." });
@@ -183,6 +191,11 @@ export default function Home() {
       return;
     }
 
+    if (!Number.isSafeInteger(ioLimitValue) || ioLimitValue < environmentLimits.ioMegabytes.min) {
+      setMessage({ type: "error", text: "I/O limit must be zero or a positive integer in MB/s." });
+      return;
+    }
+
     setSubmitting(true);
     try {
       const created = await request<Environment>("/environment", {
@@ -193,6 +206,7 @@ export default function Home() {
           cpu_quota: cpuQuotaValue,
           mem_limit: memoryLimitValue,
           cpu_weight: cpuWeightValue,
+          io_limit_bps: ioLimitValue * 1024 * 1024,
         }),
       });
       setEnvironments((current) => [...current, created]);
@@ -201,6 +215,7 @@ export default function Home() {
       setCpuQuota("50");
       setMemoryLimit("512");
       setCpuWeight("100");
+      setIoLimit("0");
       setShowEnvironmentForm(false);
       setMessage({ type: "success", text: "Ambiente criado e pronto para receber jobs." });
     } catch (error) {
@@ -226,6 +241,42 @@ export default function Home() {
     } catch (error) {
       setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível enviar o script." });
     } finally { setSubmitting(false); }
+  }
+
+  async function terminateJob(job: Job) {
+    setTerminatingJobId(job.id);
+    try {
+      const terminated = await request<Job>(`/jobs/${job.id}/terminate`, { method: "POST" });
+      setJobs((current) => current.map((item) => item.id === terminated.id ? terminated : item));
+      await refreshJob(terminated);
+      setMessage({ type: "success", text: "Job encerrado e recursos liberados." });
+    } catch (error) {
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível encerrar o job." });
+    } finally {
+      setTerminatingJobId(null);
+    }
+  }
+
+  async function deleteEnvironment() {
+    const environment = environments.find((item) => item.id === selectedEnvironment);
+    if (!environment || !window.confirm(`Remove environment ${environment.name}? Its jobs and outputs will also be removed.`)) return;
+
+    setDeletingEnvironment(true);
+    try {
+      await request<void>(`/environment/${environment.id}`, { method: "DELETE" });
+      const remainingEnvironments = environments.filter((item) => item.id !== environment.id);
+      const remainingJobs = await request<Job[]>("/jobs");
+      setEnvironments(remainingEnvironments);
+      setJobs(remainingJobs);
+      setSelectedEnvironment(remainingEnvironments[0]?.id || "");
+      setSelectedJob(null);
+      setLogs([]);
+      setMessage({ type: "success", text: "Ambiente removido e recursos liberados." });
+    } catch (error) {
+      setMessage({ type: "error", text: error instanceof Error ? error.message : "Não foi possível remover o ambiente." });
+    } finally {
+      setDeletingEnvironment(false);
+    }
   }
 
   async function rerunScript(scriptToRun: Script, targetEnvironmentId: string) {
@@ -289,7 +340,7 @@ export default function Home() {
         <nav>
           <p className="nav-label">Workspace</p>
           <a className="nav-item active" href="#overview"><span>⌁</span> Overview</a>
-          <a className="nav-item" href="#environments"><span>◫</span> Environments <b>{environments.length}</b></a>
+          <a className="nav-item" href="#environments"><span>◫</span> Environments <b>{runningEnvironments}</b></a>
           <a className="nav-item" href="#jobs"><span>▷</span> Jobs <b>{runningJobs || jobs.length}</b></a>
         </nav>
         <div className="sidebar-footer"><span className="connection-dot" /> API connected<div className="api-url">{API_URL.replace(/^https?:\/\//, "")}</div></div>
@@ -304,14 +355,14 @@ export default function Home() {
           {message && <div className={`notice notice-${message.type}`} role="status"><span>{message.type === "success" ? "✓" : "!"}</span>{message.text}<button onClick={() => setMessage(null)} aria-label="Close notification">×</button></div>}
 
           <div className="metric-row">
-            <div className="metric-card"><span>Environments</span><strong>{environments.length.toString().padStart(2, "0")}</strong><small>available now</small></div>
+            <div className="metric-card"><span>Environments</span><strong>{runningEnvironments.toString().padStart(2, "0")}</strong><small>running now</small></div>
             <div className="metric-card accent"><span>Active jobs</span><strong>{runningJobs.toString().padStart(2, "0")}</strong><small>in the queue or running</small></div>
             <div className="metric-card"><span>Total jobs</span><strong>{jobs.length.toString().padStart(2, "0")}</strong><small>across this workspace</small></div>
           </div>
 
           <div className="main-grid">
             <section className="panel environments-panel" id="environments">
-              <div className="panel-heading"><div><span className="section-kicker">01 / spaces</span><h2>Environments</h2></div><button className="button button-dark" onClick={() => setShowEnvironmentForm((value) => !value)}>+ New environment</button></div>
+              <div className="panel-heading"><div><span className="section-kicker">01 / spaces</span><h2>Environments</h2></div><div className="environment-heading-actions"><button className="button button-danger" type="button" disabled={!selectedEnvironment || deletingEnvironment} onClick={() => void deleteEnvironment()}>{deletingEnvironment ? "Removing…" : "Remove"}</button><button className="button button-dark" onClick={() => setShowEnvironmentForm((value) => !value)}>+ New environment</button></div></div>
               {showEnvironmentForm && <form className="inline-form" onSubmit={createEnvironment}>
                 <div className="environment-form-grid">
                   <div className="field field-wide">
@@ -330,13 +381,17 @@ export default function Home() {
                     <label htmlFor="cpu-weight">CPU weight</label>
                     <input id="cpu-weight" type="number" min={environmentLimits.cpuWeight.min} max={environmentLimits.cpuWeight.max} step="1" value={cpuWeight} onChange={(event) => setCpuWeight(event.target.value)} />
                   </div>
+                  <div className="field">
+                    <label htmlFor="io-limit">I/O limit <span>(MB/s)</span></label>
+                    <input id="io-limit" type="number" min={environmentLimits.ioMegabytes.min} step="1" value={ioLimit} onChange={(event) => setIoLimit(event.target.value)} />
+                  </div>
                 </div>
                 <div className="environment-form-footer">
-                  <p>CPU 1–100% · memory 1–16384 MB · weight 1–1000</p>
+                  <p>CPU 1–100% · memory 1–16384 MB · weight 1–1000 · I/O 0 = unlimited</p>
                   <button className="button button-lime" disabled={submitting}>{submitting ? "Creating…" : "Create"}</button>
                 </div>
               </form>}
-              {loading ? <div className="empty-state">Loading workspace…</div> : environments.length === 0 ? <div className="empty-state"><div className="empty-icon">⌁</div><strong>No environments yet</strong><span>Create your first space to start running scripts.</span><button className="text-button" onClick={() => setShowEnvironmentForm(true)}>Create an environment <span>↗</span></button></div> : <div className="environment-list">{environments.map((environment, index) => <button key={environment.id} className={`environment-row ${selectedEnvironment === environment.id ? "selected" : ""}`} onClick={() => setSelectedEnvironment(environment.id)}><span className="env-number">{String(index + 1).padStart(2, "0")}</span><span className="env-icon">⌂</span><span className="env-name">{environment.name}</span><span className="env-id">{environment.id.slice(0, 8)}</span><span className="row-arrow">↗</span></button>)}</div>}
+              {loading ? <div className="empty-state">Loading workspace…</div> : environments.length === 0 ? <div className="empty-state"><div className="empty-icon">⌁</div><strong>No environments yet</strong><span>Create your first space to start running scripts.</span><button className="text-button" onClick={() => setShowEnvironmentForm(true)}>Create an environment <span>↗</span></button></div> : <div className="environment-list">{environments.map((environment, index) => <div key={environment.id} className={`environment-row ${selectedEnvironment === environment.id ? "selected" : ""}`}><button className="environment-select" type="button" onClick={() => setSelectedEnvironment(environment.id)}><span className="env-number">{String(index + 1).padStart(2, "0")}</span><span className="env-icon">⌂</span><span className="env-name">{environment.name}</span><span className="env-id">{environment.id.slice(0, 8)}</span><StatusPill status={environment.status} environment /></button><Link className="environment-details-link" to={`/environment/${environment.id}`} aria-label={`View ${environment.name} details`}>↗</Link></div>)}</div>}
             </section>
 
             <section className="panel launch-panel" id="jobs">
@@ -357,10 +412,10 @@ export default function Home() {
 
           <section className="panel jobs-panel">
             <div className="panel-heading"><div><span className="section-kicker">04 / activity</span><h2>Recent jobs</h2></div><span className="muted">{jobs.length} total</span></div>
-            {jobs.length === 0 ? <div className="empty-jobs">Jobs will appear here after your first dispatch.</div> : <div className="jobs-table"><div className="table-header"><span>Job ID</span><span>Status</span><span>Action</span></div>{jobs.map((job) => <button key={job.id} className={`job-row ${selectedJob?.id === job.id ? "selected" : ""}`} onClick={() => void refreshJob(job)}><span className="job-id"><i />{job.id.slice(0, 12)}…</span><StatusPill status={job.status} /><span className="view-job">View output ↗</span></button>)}</div>}
+            {jobs.length === 0 ? <div className="empty-jobs">Jobs will appear here after your first dispatch.</div> : <div className="jobs-table"><div className="table-header"><span>Job ID</span><span>Script</span><span>Environment</span><span>Status</span><span>Action</span></div>{jobs.map((job) => <button key={job.id} className={`job-row ${selectedJob?.id === job.id ? "selected" : ""}`} onClick={() => void refreshJob(job)}><span className="job-id"><i />{job.id.slice(0, 12)}…</span><span className="job-script">{job.script_name}</span><span className="job-environment">{job.env_name}</span><StatusPill status={job.status} /><span className="view-job">View output ↗</span></button>)}</div>}
           </section>
 
-          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><div className="terminal-heading-actions"><fieldset className="polling-control output-polling"><legend>Polling</legend><div className="polling-options" role="group" aria-label="Output polling interval">{pollingOptions.map((option) => <button key={option.value} type="button" className={`polling-option ${pollingInterval === option.value ? "selected" : ""}`} aria-pressed={pollingInterval === option.value} onClick={() => setPollingInterval(option.value)}>{option.label}</button>)}<button type="button" className={`polling-option ${pollingInterval === "custom" ? "selected" : ""}`} aria-pressed={pollingInterval === "custom"} onClick={() => setPollingInterval("custom")}>Custom</button></div>{pollingInterval === "custom" && <label className="custom-polling-field" htmlFor="custom-polling-seconds"><span>Every</span><input id="custom-polling-seconds" type="number" min="1" max="3600" step="1" value={customPollingSeconds} onChange={(event) => setCustomPollingSeconds(event.target.value)} /><span>seconds</span></label>}<small className="polling-note">Output checks · min 1s · max 1h</small></fieldset><StatusPill status={selectedJob.status} /></div></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
+          {selectedJob && <section className="panel terminal-panel"><div className="terminal-heading"><div><span className="section-kicker">Job output</span><h2>{selectedJob.id.slice(0, 18)}…</h2></div><div className="terminal-heading-actions"><fieldset className="polling-control output-polling"><legend>Polling</legend><div className="polling-options" role="group" aria-label="Output polling interval">{pollingOptions.map((option) => <button key={option.value} type="button" className={`polling-option ${pollingInterval === option.value ? "selected" : ""}`} aria-pressed={pollingInterval === option.value} onClick={() => setPollingInterval(option.value)}>{option.label}</button>)}<button type="button" className={`polling-option ${pollingInterval === "custom" ? "selected" : ""}`} aria-pressed={pollingInterval === "custom"} onClick={() => setPollingInterval("custom")}>Custom</button></div>{pollingInterval === "custom" && <label className="custom-polling-field" htmlFor="custom-polling-seconds"><span>Every</span><input id="custom-polling-seconds" type="number" min="1" max="3600" step="1" value={customPollingSeconds} onChange={(event) => setCustomPollingSeconds(event.target.value)} /><span>seconds</span></label>}<small className="polling-note">Output checks · min 1s · max 1h</small></fieldset>{["queued", "running"].includes(selectedJob.status) && <button className="button button-danger" type="button" disabled={terminatingJobId === selectedJob.id} onClick={() => void terminateJob(selectedJob)}>{terminatingJobId === selectedJob.id ? "Stopping…" : "Terminate"}</button>}<StatusPill status={selectedJob.status} /></div></div><div className="terminal"><div className="terminal-bar"><span /><span /><span /> <small>stdout / stderr</small></div>{logs.length === 0 ? <div className="terminal-empty">Waiting for output<span className="cursor">_</span></div> : logs.map((log, index) => <div className="log-line" key={`${log.created_at}-${index}`}><time>{new Date(log.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={log.source === "stderr" ? "stderr" : ""}>{log.source}</b><code>{log.content}</code></div>)}</div></section>}
 
           {rerunTargetScript && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setRerunTargetScript(null); }}><form className="modal" role="dialog" aria-modal="true" aria-labelledby="rerun-dialog-title" onSubmit={confirmRerunInOtherEnvironment}><div className="modal-header"><div><span className="section-kicker">Run elsewhere</span><h2 id="rerun-dialog-title">Choose an environment</h2></div><button className="modal-close" type="button" aria-label="Close" onClick={() => setRerunTargetScript(null)}>×</button></div><div className="modal-body"><p>Select where <strong>{rerunTargetScript.name}</strong> should run.</p>{environments.filter((environment) => environment.id !== selectedEnvironment).length === 0 ? <p className="modal-empty">There is no other environment available.</p> : <select value={rerunTargetEnvironment} onChange={(event) => setRerunTargetEnvironment(event.target.value)} aria-label="Target environment"><option value="">Select an environment</option>{environments.filter((environment) => environment.id !== selectedEnvironment).map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}</select>}</div><div className="modal-footer"><button className="button button-quiet" type="button" onClick={() => setRerunTargetScript(null)}>Cancel</button><button className="button button-lime" type="submit" disabled={!rerunTargetEnvironment || rerunningScriptId !== null}>Run script ↗</button></div></form></div>}
 

@@ -53,12 +53,12 @@ def configure_environment_cgroup(
     (cgroup_path / "cpu.max").write_text(f"{quota} {period}\n")
     (cgroup_path / "cpu.weight").write_text(f"{cpu_weight}\n")
     (cgroup_path / "memory.max").write_text(f"{memory_bytes}\n")
-    if io_limit_bps > 0:
-        device = os.stat("/").st_dev
-        major, minor = os.major(device), os.minor(device)
-        (cgroup_path / "io.max").write_text(
-            f"{major}:{minor} rbps={io_limit_bps} wbps={io_limit_bps}\n"
-        )
+    device = os.stat("/").st_dev
+    major, minor = os.major(device), os.minor(device)
+    io_limit = str(io_limit_bps) if io_limit_bps > 0 else "max"
+    (cgroup_path / "io.max").write_text(
+        f"{major}:{minor} rbps={io_limit} wbps={io_limit}\n"
+    )
 
 
 async def configure_network_namespace(anchor_pid: int) -> None:
