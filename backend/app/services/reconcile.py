@@ -69,6 +69,7 @@ async def _restore_environments() -> None:
                 """
                 SELECT id, name, cpu_quota, mem_limit, cpu_weight, io_limit_bps
                 FROM environments
+                WHERE status != 'terminated'
                 """
             )
         )

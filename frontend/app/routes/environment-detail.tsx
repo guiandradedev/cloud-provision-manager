@@ -71,8 +71,14 @@ export default function EnvironmentDetailPage() {
 
   useEffect(() => { void loadEnvironment(); }, [loadEnvironment]);
 
+  const environmentRunning = environment?.status === "running";
+
   async function updateLimits(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!environmentRunning) {
+      setMessage({ type: "error", text: "Limits can only be changed in an active environment." });
+      return;
+    }
     const cpuQuotaValue = Number(cpuQuota);
     const memoryLimitValue = Number(memoryLimit);
     const cpuWeightValue = Number(cpuWeight);
@@ -137,12 +143,12 @@ export default function EnvironmentDetailPage() {
             <section className="panel">
               <div className="panel-heading"><div><span className="section-kicker">Configuration</span><h2>Resource limits</h2></div></div>
               <form className="detail-form" onSubmit={updateLimits}>
-                <label>CPU limit <span>(%)</span><input type="number" min="1" max="100" step="1" value={cpuQuota} onChange={(event) => setCpuQuota(event.target.value)} /></label>
-                <label>Memory <span>(MB)</span><input type="number" min="1" max="16384" step="1" value={memoryLimit} onChange={(event) => setMemoryLimit(event.target.value)} /></label>
-                <label>CPU weight<input type="number" min="1" max="1000" step="1" value={cpuWeight} onChange={(event) => setCpuWeight(event.target.value)} /></label>
-                <label>I/O limit <span>(MB/s)</span><input type="number" min="0" step="1" value={ioLimit} onChange={(event) => setIoLimit(event.target.value)} /></label>
-                <p>I/O 0 = unlimited</p>
-                <button className="button button-lime" disabled={saving}>{saving ? "Saving…" : "Save limits"}</button>
+                <label>CPU limit <span>(%)</span><input type="number" min="1" max="100" step="1" value={cpuQuota} disabled={!environmentRunning} onChange={(event) => setCpuQuota(event.target.value)} /></label>
+                <label>Memory <span>(MB)</span><input type="number" min="1" max="16384" step="1" value={memoryLimit} disabled={!environmentRunning} onChange={(event) => setMemoryLimit(event.target.value)} /></label>
+                <label>CPU weight<input type="number" min="1" max="1000" step="1" value={cpuWeight} disabled={!environmentRunning} onChange={(event) => setCpuWeight(event.target.value)} /></label>
+                <label>I/O limit <span>(MB/s)</span><input type="number" min="0" step="1" value={ioLimit} disabled={!environmentRunning} onChange={(event) => setIoLimit(event.target.value)} /></label>
+                <p>{environmentRunning ? "I/O 0 = unlimited" : "Terminated environments are read-only."}</p>
+                <button className="button button-lime" disabled={saving || !environmentRunning}>{saving ? "Saving…" : "Save limits"}</button>
               </form>
             </section>
 
