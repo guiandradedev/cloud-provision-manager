@@ -53,6 +53,9 @@ def configure_environment_cgroup(
     (cgroup_path / "cpu.max").write_text(f"{quota} {period}\n")
     (cgroup_path / "cpu.weight").write_text(f"{cpu_weight}\n")
     (cgroup_path / "memory.max").write_text(f"{memory_bytes}\n")
+    swap_max = cgroup_path / "memory.swap.max"
+    if swap_max.exists():
+        swap_max.write_text("0\n")
     device = os.stat("/").st_dev
     major, minor = os.major(device), os.minor(device)
     io_limit = str(io_limit_bps) if io_limit_bps > 0 else "max"
