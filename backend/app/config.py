@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "mysql://root:root@localhost:3306/provision-manager"
+    storage_dir: str = "storage"
     port: int = 3000
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 

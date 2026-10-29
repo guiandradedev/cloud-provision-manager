@@ -22,7 +22,18 @@ EOF
 
 sysctl -p /etc/sysctl.d/99-provision-manager-gateway.conf
 
-WAN_IF=$(ip route show default | awk '{print $5; exit}')
+WAN_IF=""
+
+for _ in $(seq 1 30); do
+    WAN_IF=$(ip route show default | awk '{print $5; exit}')
+    [ -n "$WAN_IF" ] && break
+    sleep 1
+done
+
+if [ -z "$WAN_IF" ]; then
+    echo "Não foi possível identificar a interface NAT pela rota padrão." >&2
+    exit 1
+fi
 
 # Encaminha o DNS recebido em 10.20.30.1 para o DNS do NAT do VirtualBox.
 iptables -t nat -C PREROUTING -d 10.20.30.1 -p udp --dport 53 -j DNAT --to-destination 10.0.2.3 2>/dev/null || \
@@ -94,14 +105,15 @@ rm -f /etc/nginx/sites-enabled/default
 
 ## Inicia o cgroupsv2
 mount | grep cgroup2
-echo "+cpu +cpuset" > /sys/fs/cgroup/cgroup.subtree_control
+echo "+cpu +cpuset +memory +io" > /sys/fs/cgroup/cgroup.subtree_control
 
 cd /home/application/provision-manager/backend
+install -d -m 0755 /var/lib/provision-manager/scripts /var/lib/provision-manager/outputs
+# !
+python3 -m venv /opt/venv
 
-python3 -m venv venv
-
-./venv/bin/pip install --upgrade pip
-./venv/bin/pip install -r requirements.txt
+/opt/venv/bin/pip install --upgrade pip
+/opt/venv/bin/pip install -r requirements.txt
 
 cat > /etc/systemd/system/provision-manager-backend.service <<EOT
 [Unit]
@@ -112,11 +124,15 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
+IOAccounting=yes
 WorkingDirectory=/home/application/provision-manager/backend
 Environment="DATABASE_URL=mysql+aiomysql://${DB_USER}:${DB_PASS}@10.20.30.3:3306/mydb"
+Environment="STORAGE_DIR=/var/lib/provision-manager"
+Environment="CORS_ORIGINS=${ALLOWED_ORIGIN_URL}"
 ExecStartPre=/bin/sh -c 'until nc -z 10.20.30.3 3306; do sleep 2; done'
 TimeoutStartSec=infinity
-ExecStart=/home/application/provision-manager/backend/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8082
+# !
+ExecStart=/opt/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8082
 SuccessExitStatus=143
 Restart=always
 RestartSec=10

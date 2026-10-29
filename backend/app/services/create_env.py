@@ -1,103 +1,84 @@
 import asyncio
-from os import mkdir
-from pathlib import Path
-from ..utils.commands import run_command
+from pydantic import BaseModel
 
-from sqlalchemy import text
+from .runtime import (
+    CGROUPS_DIR,
+    EnvironmentRuntime,
+    cleanup_environment_cgroup,
+    configure_environment_cgroup,
+    configure_network_namespace,
+    environment_cgroup_name,
+    environment_cgroup_path,
+    find_environment_anchor,
+    has_isolated_network_namespace,
+)
 
-SYSTEMD_DIR = Path("/etc/systemd/system")
-ENVIRONMENTS_DIR = Path("/var/lib/provision-manager/environments")
-CGROUPS_DIR = Path("/sys/fs/cgroup")
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-LAUNCHER_PATH = PROJECT_ROOT / "app" / "services" / "start-env.sh"
+class CreateEnvironment(BaseModel):
+    env_id: str
+    name: str
+    cpu_quota: int
+    cpu_weight: int
+    mem_limit: int
+    io_limit_bps: int = 0
 
-async def start_env(env_name: str) -> int:
+async def create_env(env: CreateEnvironment) -> EnvironmentRuntime:
+    cgroup_name = environment_cgroup_name(env.name, env.env_id)
+    cgroup_path = environment_cgroup_path(cgroup_name)
+    cgroup_existed = cgroup_path.exists()
+
+    try:
+        (CGROUPS_DIR / "cgroup.subtree_control").write_text("+cpu +memory +io")
+    except Exception:
+        pass
+
+    cgroup_path.mkdir(parents=True, exist_ok=True)
+    configure_environment_cgroup(
+        cgroup_path,
+        cpu_quota=env.cpu_quota,
+        cpu_weight=env.cpu_weight,
+        mem_limit=env.mem_limit,
+        io_limit_bps=env.io_limit_bps,
+    )
+
+    anchor_pid = find_environment_anchor(cgroup_path)
+    if anchor_pid is not None and has_isolated_network_namespace(anchor_pid):
+        await configure_network_namespace(anchor_pid)
+        return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
+
+    if cgroup_existed:
+        await cleanup_environment_cgroup(cgroup_name)
+        cgroup_path.mkdir(parents=True, exist_ok=False)
+        configure_environment_cgroup(
+            cgroup_path,
+            cpu_quota=env.cpu_quota,
+            cpu_weight=env.cpu_weight,
+            mem_limit=env.mem_limit,
+            io_limit_bps=env.io_limit_bps,
+        )
+
+    hostname = cgroup_name.replace("_", "-")[:63]
+    cmd = (
+        f"echo $$ > {cgroup_path}/cgroup.procs && "
+        f"exec /usr/bin/unshare --mount --pid --fork --uts --ipc --net --mount-proc "
+        f"/bin/bash -c 'hostname {hostname}; exec sleep infinity'"
+    )
+
     proc = await asyncio.create_subprocess_exec(
-        "bash",
-        str(LAUNCHER_PATH),
-        env_name,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        "bash", "-c", cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    # Dá tempo para o launcher falhar durante a inicialização.
-    try:
-        _, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=2,
-        )
-    except asyncio.TimeoutError:
-        # O processo continua vivo: o ambiente foi iniciado
-        # ou ainda está inicializando.
-        return proc.pid
 
-    if proc.returncode != 0:
-        raise RuntimeError(
-            stderr.decode(errors="replace")
-        )
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        anchor_pid = find_environment_anchor(cgroup_path)
+        if anchor_pid is not None:
+            await configure_network_namespace(anchor_pid)
+            return EnvironmentRuntime(cgroup_name=cgroup_name, anchor_pid=anchor_pid)
+        if proc.returncode is not None:
+            break
 
-    return proc.pid
-
-
-class CreateEnvironment():
-    def __init__(self, env_id: str, name: str, cpu_quota: int, cpu_weight: int, mem_limit: int):
-        self.env_id = env_id
-        self.name = name
-        self.cpu_quota = cpu_quota # %
-        self.cpu_weight = cpu_weight # 
-        self.mem_limit = mem_limit # MB
-
-async def create_env(env: CreateEnvironment) -> int:
-    if env.cpu_quota <= 0 or env.cpu_quota > 100:
-        raise ValueError("CPU quota must be between 1 and 100")
-
-    if env.mem_limit <= 0 or env.mem_limit > 16384:
-        raise ValueError("Memory limit must be between 1 and 16384 MB")
-
-    if not env.name:
-        raise ValueError("Environment name must not be empty")
-
-    new_env_name = (
-        env.name.replace(" ", "_").lower()
-        + f"_{env.env_id[:8]}"
+    await cleanup_environment_cgroup(cgroup_name)
+    raise RuntimeError(
+        f"Namespace anchor did not start (exit={proc.returncode})"
     )
-    cgroup_path = CGROUPS_DIR / new_env_name
-
-    period = 100_000
-    quota = env.cpu_quota * period // 100
-    memory_bytes = env.mem_limit * 1024 * 1024
-
-    try:
-        # Cria e configura o cgroup.
-        await run_command(
-            "mkdir", "-p", str(cgroup_path)
-        )
-
-        await run_command(
-            "bash", "-c",
-            'printf "%s %s" "$1" "$2" > "$3"',
-            "bash", str(quota), str(period),
-            str(cgroup_path / "cpu.max")
-        )
-
-        await run_command(
-            "bash", "-c",
-            'printf "%s" "$1" > "$2"',
-            "bash", str(env.cpu_weight),
-            str(cgroup_path / "cpu.weight")
-        )
-
-        await run_command(
-            "bash", "-c",
-            'printf "%s" "$1" > "$2"',
-            "bash", str(memory_bytes),
-            str(cgroup_path / "memory.max")
-        )
-
-    except Exception as e:
-        print(f"Failed to create environment {new_env_name}: {e}")
-        return 1
-
-    start_pid = await start_env(new_env_name)
-    print(start_pid)
-
-    return 0

@@ -32,6 +32,7 @@ env_vars = {
 
 
 Vagrant.configure("2") do |config|
+    config.vm.synced_folder ".", "/vagrant", disabled: true
 
     is_arm = RUBY_PLATFORM.include?("arm64") || RUBY_PLATFORM.include?("aarch64")
 
@@ -80,8 +81,8 @@ Vagrant.configure("2") do |config|
 
                 rm -rf provision-manager
                 git clone --branch "${BRANCH_NAME}" --single-branch "${REPO_URL}" provision-manager
+                
                 cd provision-manager/infra/scripts
-
                 if [[ "#{nome}" != "webserver" ]]; then
                     sh ./setup-common-network.sh
                 fi
