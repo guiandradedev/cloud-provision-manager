@@ -108,6 +108,7 @@ mount | grep cgroup2
 echo "+cpu +cpuset +memory +io" > /sys/fs/cgroup/cgroup.subtree_control
 
 cd /home/application/provision-manager/backend
+install -d -m 0755 /var/lib/provision-manager/scripts /var/lib/provision-manager/outputs
 # !
 python3 -m venv /opt/venv
 
@@ -126,6 +127,7 @@ User=root
 IOAccounting=yes
 WorkingDirectory=/home/application/provision-manager/backend
 Environment="DATABASE_URL=mysql+aiomysql://${DB_USER}:${DB_PASS}@10.20.30.3:3306/mydb"
+Environment="STORAGE_DIR=/var/lib/provision-manager"
 ExecStartPre=/bin/sh -c 'until nc -z 10.20.30.3 3306; do sleep 2; done'
 TimeoutStartSec=infinity
 # !

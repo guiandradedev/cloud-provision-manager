@@ -1,4 +1,3 @@
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,8 +9,9 @@ from .migrations import run_migrations
 from .routes import router
 from .services.create_job import shutdown_scheduled_jobs
 from .services.reconcile import reconcile_runtime_state
+from .services.storage import prepare_storage
 
-os.mkdir("uploads") if not os.path.exists("uploads") else None
+prepare_storage()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):

@@ -15,9 +15,9 @@ from .services.runtime import (
     cleanup_job_cgroup,
     environment_cgroup_name,
 )
+from .services.storage import job_output_path, script_path
 
 router = APIRouter(tags=["jobs"])
-UPLOADS_DIR = Path("uploads")
 
 
 class CreateEnvironmentRequest(BaseModel):
@@ -164,8 +164,7 @@ async def create_job(
     if not script.filename or not script.filename.endswith(".sh"):
         raise HTTPException(status_code=400, detail="Invalid script file type")
 
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    file_path = UPLOADS_DIR / f"{job_id}-{Path(script.filename).name}"
+    file_path = script_path(job_id, script.filename)
     contents = await script.read()
 
     try:
@@ -460,6 +459,11 @@ async def delete_environment(env_id: str) -> Response:
             {"env_id": env_id},
         )
         file_paths = file_result.scalars().all()
+        job_result = await session.execute(
+            text("SELECT id FROM jobs WHERE env_id = :env_id"),
+            {"env_id": env_id},
+        )
+        job_ids = job_result.scalars().all()
 
         await session.execute(
             text(
@@ -501,6 +505,12 @@ async def delete_environment(env_id: str) -> Response:
             Path(file_path).unlink(missing_ok=True)
         except OSError as error:
             print(f"Could not remove uploaded file {file_path}: {error}")
+    for job_id in job_ids:
+        output_path = job_output_path(job_id)
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"Could not remove output file {output_path}: {error}")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

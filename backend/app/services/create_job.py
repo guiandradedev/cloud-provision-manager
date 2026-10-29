@@ -9,6 +9,7 @@ from .runtime import (
     job_cgroup_name,
     prepare_job_cgroup,
 )
+from .storage import append_job_output
 
 _job_tasks: dict[str, asyncio.Task[int]] = {}
 
@@ -50,6 +51,7 @@ async def cancel_scheduled_job(job_id: str) -> bool:
 
 
 async def save_log(job_id: str, stream: str, message: str) -> None:
+    append_job_output(job_id, stream, message)
     async with SessionLocal() as session:
         await session.execute(
             text(
