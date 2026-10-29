@@ -128,6 +128,7 @@ IOAccounting=yes
 WorkingDirectory=/home/application/provision-manager/backend
 Environment="DATABASE_URL=mysql+aiomysql://${DB_USER}:${DB_PASS}@10.20.30.3:3306/mydb"
 Environment="STORAGE_DIR=/var/lib/provision-manager"
+Environment="CORS_ORIGINS=${ALLOWED_ORIGIN_URL}"
 ExecStartPre=/bin/sh -c 'until nc -z 10.20.30.3 3306; do sleep 2; done'
 TimeoutStartSec=infinity
 # !
